@@ -27,8 +27,8 @@
 ### 1. 下载源码
 
 ```bash
-git clone https://github.com/WoodGoose/dow-849.git
-cd dow-849
+git clone https://github.com/AnCool-OvO/dify-on-wechat-ipad.git
+cd dify-on-wechat-ipad
 ```
 
 ### 2. 安装依赖
@@ -52,9 +52,8 @@ pip install -r requirements-optional.txt
     "channel_type": "wx849",             
     "wx849_api_host": "127.0.0.1",  # 微信849协议API地址
     "wx849_api_port": 9000,  # 微信849协议API端口
-    "wx849_protocol_version": "849",  # 微信849协议版本，可选: "849", "855", "ipad"
-    "log_level": "INFO",     
-    "debug": true,                       
+    "wx849_protocol_version": "849",  # 微信849协议版本，暂不可选: "855", "ipad"
+    "log_level": "INFO",                        
     "model": "dify",                     
     "single_chat_prefix": [""],          
     "group_chat_prefix": ["@bot"],       

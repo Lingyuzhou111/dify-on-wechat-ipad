@@ -50,7 +50,7 @@ pip install -r requirements-optional.txt
   "wx849_api_port": 9011,           # 微信849协议API端口
   "wx849_protocol_version": "849",  # 微信849协议版本，暂不可选: "855", "ipad"
   "log_level": "INFO",
-  "group_chat_prefix": ["xy","晓颜","@晓颜"],  # 改成你自己的bot昵称
+  "group_chat_prefix": ["xy","晓颜","@晓颜"],   # 改成你自己的bot昵称
   "group_name_white_list": [
         "测试群1",
         "测试群2",
@@ -79,7 +79,7 @@ pip install -r requirements-optional.txt
   "single_chat_reply_prefix": "",  # 选填
   "temperature": 0.5,
   "zhipu_ai_api_base": "https://open.bigmodel.cn/api/paas/v4",
-  "zhipu_ai_api_key": "",  # 选填
+  "zhipu_ai_api_key": "",          # 选填
   "zhipuai_model": "glm-4-flash-250414"  
 }
 ```

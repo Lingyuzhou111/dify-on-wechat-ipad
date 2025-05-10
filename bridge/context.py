@@ -11,8 +11,10 @@ class ContextType(Enum):
     VIDEO = 5  # 视频信息
     SHARING = 6  # 分享信息
     EMOJI=7  #表情图片
-
+    REFERENCE = 8  # 引用消息
+    
     IMAGE_CREATE = 10  # 创建图片命令
+
     ACCEPT_FRIEND = 19 # 同意好友请求
     JOIN_GROUP = 20  # 加入群聊
     PATPAT = 21  # 拍了拍

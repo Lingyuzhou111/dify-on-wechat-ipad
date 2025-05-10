@@ -9,7 +9,7 @@ import traceback  # 添加traceback模块导入
 import xml.etree.ElementTree as ET  # 在顶部添加ET导入
 import aiohttp  # 添加aiohttp模块导入
 import re  # 添加re模块导入
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Union, BinaryIO, Optional, Tuple, List, Dict
 import urllib.parse  # 添加urllib.parse模块导入
 import requests
 from bridge.context import Context, ContextType  # 确保导入Context类
@@ -21,7 +21,7 @@ from common.expired_dict import ExpiredDict
 from common.log import logger
 from common.singleton import singleton
 from common.time_check import time_checker
-from common.utils import remove_markdown_symbol
+from common.utils import remove_markdown_symbol, split_string_by_utf8_length
 from config import conf, get_appdata_dir
 from voice.audio_convert import split_audio # Added for voice splitting
 from common.tmp_dir import TmpDir # Added for temporary file management
@@ -1019,6 +1019,93 @@ class WX849Channel(ChatChannel):
         thread = threading.Thread(target=run_loop)
         thread.daemon = True
         thread.start()
+
+    @_check
+    async def _handle_message(self, wx_msg: 'WX849Message'): # wx_msg type hint is 'WX849Message'
+        """处理单个接收到的消息，应用过滤规则，构建上下文并生产消息"""
+
+        if not wx_msg:
+            logger.debug("[WX849] Received an empty message object, ignoring.")
+            return
+
+        _sender_wxid = getattr(wx_msg, 'sender_wxid', 'UnknownSender')
+        _content_value = getattr(wx_msg, 'content', '')
+        _message_content_preview = f"(content type: {type(_content_value)}, first 50 chars: {str(_content_value)[:50]})"
+        _message_type = getattr(wx_msg, 'type', None) # In WX849Message, self.type is already a ContextType
+        _message_create_time = getattr(wx_msg, 'create_time', None) # Expected to be a Unix timestamp
+
+        # 1. Ignore non-user messages (e.g., official accounts starting with 'gh_')
+        if isinstance(_sender_wxid, str) and _sender_wxid.startswith("gh_"):
+            logger.debug(f"[WX849] Ignored official account message from {_sender_wxid}: {_message_content_preview}")
+            return
+
+        # 2. Ignore voice messages if speech recognition is off
+        if _message_type == ContextType.VOICE:
+            if conf().get("speech_recognition") != True:
+                logger.debug(f"[WX849] Ignored voice message (speech recognition off): from {_sender_wxid}")
+                return
+
+        # 3. Ignore messages from self (self.user_id should be the bot's own WXID)
+        if self.user_id and _sender_wxid == self.user_id:
+            logger.debug(f"[WX849] Ignored message from myself ({self.user_id}): {_message_content_preview}")
+            return
+
+        # 4. Ignore expired messages (e.g., older than 5 minutes)
+        if _message_create_time:
+            try:
+                # Ensure create_time is treated as a number (float or int)
+                msg_ts = float(_message_create_time)
+                current_ts = time.time()
+                if msg_ts < (current_ts - 300):  # 300 seconds = 5 minutes
+                    logger.debug(f"[WX849] Ignored expired message (timestamp: {msg_ts}) from {_sender_wxid}: {_message_content_preview}")
+                    return
+            except (ValueError, TypeError): # Handle cases where create_time might not be a valid number or string representing one
+                logger.warning(f"[WX849] Could not parse create_time '{_message_create_time}' as a number for sender {_sender_wxid}.")
+            except Exception as e: # Catch any other unexpected errors during time comparison
+                logger.warning(f"[WX849] Error checking expired message for sender {_sender_wxid}: {e}")
+        
+        # 5. Ignore status sync messages (similar to gewechat)
+        if _message_type == ContextType.STATUS_SYNC:
+            logger.debug(f"[WX849] Ignored status sync message from {_sender_wxid}: {_message_content_preview}")
+            return
+        # Filter rules end
+
+        # Check if message has already been processed (to avoid duplicates)
+        # This is an existing part of the logic, ensure it's still here after the filters.
+        if wx_msg and hasattr(wx_msg, 'msg_id') and wx_msg.msg_id:
+            wx_msg_key = f"{wx_msg.msg_id}_{wx_msg.sender_wxid}_{wx_msg.create_time}"
+            if wx_msg_key in self.received_msgs:
+                logger.debug(f"[WX849] 已处理的消息，跳过: {wx_msg_key}")
+                return
+            self.received_msgs[wx_msg_key] = wx_msg  # Mark as processed
+        else:
+            logger.debug("[WX849] Message does not have a unique msg_id for duplicate checking, proceeding with caution.")
+        
+        logger.debug(f"[WX849] Message from {wx_msg.sender_wxid} passed filters, proceeding to compose context. Type: {wx_msg.type}, Content: {_message_content_preview}")
+
+        try:
+            ctype = wx_msg.type
+            content = wx_msg.content
+
+            context = self._compose_context(
+                ctype,
+                content,
+                isgroup=wx_msg.is_group,
+                msg=wx_msg,
+                actual_user_id=wx_msg.actual_user_id, # actual_user_id is important for group messages
+                from_user_id=wx_msg.sender_wxid,      # from_user_id (sender in group or private chat)
+                to_user_id=self.user_id,              # to_user_id (usually the bot itself)
+                other_user_id=wx_msg.other_user_id    # other_user_id (group_id if group, or sender if private)
+            )
+            if context:
+                logger.debug(f"[WX849] Context composed: {context}")
+                self.produce(context)
+            else:
+                logger.warning("[WX849] Failed to compose context from wx_msg.")
+        except Exception as e:
+            logger.error(f"[WX849] Error in _handle_message after filters: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     @_check
     async def handle_single(self, cmsg: ChatMessage):

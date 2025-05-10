@@ -26,8 +26,24 @@ class DifyBot(Bot):
     def __init__(self):
         super().__init__()
         self.sessions = DifySessionManager(DifySession, model=conf().get("model", const.DIFY))
+        # 初始化内部状态
+        self.current_app_type = conf().get("dify_app_type", "chatflow")
+        # 支持的应用类型列表
+        self.supported_app_types = [
+            const.DIFY_CHATBOT,    # "chatbot"
+            const.DIFY_AGENT,      # "agent"
+            const.DIFY_CHATFLOW,   # "chatflow"
+            const.DIFY_WORKFLOW    # "workflow"
+        ]
+        # 初始化API配置
+        self.api_key = conf().get("dify_api_key", "")
+        self.api_base = conf().get("dify_api_base", "https://api.dify.ai/v1")
 
     def reply(self, query, context: Context=None):
+        # 处理模型切换命令
+        if query.startswith("#model "):
+            return self._handle_model_command(query[7:].strip())
+            
         # acquire reply content
         if context.type == ContextType.TEXT or context.type == ContextType.IMAGE_CREATE:
             if context.type == ContextType.IMAGE_CREATE:
@@ -35,14 +51,14 @@ class DifyBot(Bot):
             logger.info("[DIFY] query={}".format(query))
             session_id = context["session_id"]
             # TODO: 适配除微信以外的其他channel
-            channel_type = conf().get("channel_type", "wx")
+            channel_type = conf().get("channel_type", "wx849")
             user = None
-            if channel_type in ["wx", "wework", "gewechat", "wx849"]:
+            if channel_type in ["wx849", "wework", "gewechat"]:
                 user = context["msg"].other_user_nickname if context.get("msg") else "default"
             elif channel_type in ["wechatcom_app", "wechatmp", "wechatmp_service", "wechatcom_service", "web"]:
                 user = context["msg"].other_user_id if context.get("msg") else "default"
             else:
-                return Reply(ReplyType.ERROR, f"unsupported channel type: {channel_type}, now dify only support wx, wx849, wechatcom_app, wechatmp, wechatmp_service channel")
+                return Reply(ReplyType.ERROR, f"unsupported channel type: {channel_type}, now dify only support wx, wechatcom_app, wechatmp, wechatmp_service channel")
             logger.debug(f"[DIFY] dify_user={user}")
             user = user if user else "default" # 防止用户名为None，当被邀请进的群未设置群名称时用户名为None
             session = self.sessions.get_session(session_id, user)
@@ -75,6 +91,18 @@ class DifyBot(Bot):
             reply = Reply(ReplyType.ERROR, "Bot不支持处理{}类型的消息".format(context.type))
             return reply
 
+    def _handle_model_command(self, model):
+        """处理模型切换命令"""
+        if model in self.supported_app_types:
+            # 更新内部状态
+            self.current_app_type = model
+            # 返回成功消息
+            return Reply(ReplyType.INFO, f"已切换到 {model} 模式")
+        else:
+            # 返回错误消息
+            supported_types = ", ".join(self.supported_app_types)
+            return Reply(ReplyType.ERROR, f"不支持的应用类型: {model}。支持的类型有: {supported_types}")
+
     # TODO: delete this function
     def _get_payload(self, query, session: DifySession, response_mode):
         # 输入的变量参考 wechat-assistant-pro：https://github.com/leochen-g/wechat-assistant-pro/issues/76
@@ -97,15 +125,15 @@ class DifyBot(Bot):
     def _reply(self, query: str, session: DifySession, context: Context):
         try:
             session.count_user_message() # 限制一个conversation中消息数，防止conversation过长
-            dify_app_type = self._get_dify_conf(context, "dify_app_type", 'chatbot')
-            if dify_app_type == 'chatbot' or dify_app_type == 'chatflow':
+            # 使用内部状态而不是配置
+            if self.current_app_type == 'chatbot' or self.current_app_type == 'chatflow':
                 return self._handle_chatbot(query, session, context)
-            elif dify_app_type == 'agent':
+            elif self.current_app_type == 'agent':
                 return self._handle_agent(query, session, context)
-            elif dify_app_type == 'workflow':
+            elif self.current_app_type == 'workflow':
                 return self._handle_workflow(query, session, context)
             else:
-                friendly_error_msg = "[DIFY] 请检查 config.json 中的 dify_app_type 设置，目前仅支持 agent, chatbot, chatflow, workflow"
+                friendly_error_msg = "[DIFY] 当前应用类型设置错误，目前仅支持 agent, chatbot, chatflow, workflow"
                 return None, friendly_error_msg
 
         except Exception as e:
@@ -114,8 +142,8 @@ class DifyBot(Bot):
             return None, UNKNOWN_ERROR_MSG
 
     def _handle_chatbot(self, query: str, session: DifySession, context: Context):
-        api_key = self._get_dify_conf(context, "dify_api_key", '')
-        api_base = self._get_dify_conf(context, "dify_api_base", "https://api.dify.ai/v1")
+        api_key = self.api_key
+        api_base = self.api_base
         chat_client = ChatClient(api_key, api_base)
         response_mode = 'blocking'
         payload = self._get_payload(query, session, response_mode)
@@ -250,8 +278,8 @@ class DifyBot(Bot):
         return None
 
     def _handle_agent(self, query: str, session: DifySession, context: Context):
-        api_key = self._get_dify_conf(context, "dify_api_key", '')
-        api_base = self._get_dify_conf(context, "dify_api_base", "https://api.dify.ai/v1")
+        api_key = self.api_key
+        api_base = self.api_base
         chat_client = ChatClient(api_key, api_base)
         response_mode = 'streaming'
         payload = self._get_payload(query, session, response_mode)
@@ -277,7 +305,7 @@ class DifyBot(Bot):
         # data: {"event": "message_end", "task_id": "9cf1ddd7-f94b-459b-b942-b77b26c59e9b", "id": "1fb10045-55fd-4040-99e6-d048d07cbad3", "message_id": "1fb10045-55fd-4040-99e6-d048d07cbad3", "conversation_id": "c216c595-2d89-438c-b33c-aae5ddddd142", "metadata": {"usage": {"prompt_tokens": 305, "prompt_unit_price": "0.001", "prompt_price_unit": "0.001", "prompt_price": "0.0003050", "completion_tokens": 97, "completion_unit_price": "0.002", "completion_price_unit": "0.001", "completion_price": "0.0001940", "total_tokens": 184, "total_price": "0.0002290", "currency": "USD", "latency": 1.771092874929309}}}
         msgs, conversation_id = self._handle_sse_response(response)
         channel = context.get("channel")
-        # TODO: 适配除微信以外的其他channel，已添加wx849
+        # TODO: 适配除微信以外的其他channel
         is_group = context.get("isgroup", False)
         for msg in msgs[:-1]:
             if msg['type'] == 'agent_message':
@@ -291,9 +319,6 @@ class DifyBot(Bot):
                 reply = Reply(ReplyType.IMAGE_URL, url)
                 thread = threading.Thread(target=channel.send, args=(reply, context))
                 thread.start()
-        # 检查msgs是否为空
-        if not msgs:
-            return None, "No messages received from agent."
         final_msg = msgs[-1]
         reply = None
         if final_msg['type'] == 'agent_message':
@@ -308,8 +333,8 @@ class DifyBot(Bot):
 
     def _handle_workflow(self, query: str, session: DifySession, context: Context):
         payload = self._get_workflow_payload(query, session)
-        api_key = self._get_dify_conf(context, "dify_api_key", '')
-        api_base = self._get_dify_conf(context, "dify_api_base", "https://api.dify.ai/v1")
+        api_key = self.api_key
+        api_base = self.api_base
         dify_client = DifyClient(api_key, api_base)
         response = dify_client._send_request("POST", "/workflows/run", json=payload)
         if response.status_code != 200:
@@ -351,8 +376,8 @@ class DifyBot(Bot):
             return None
         # 清理图片缓存
         memory.USER_IMAGE_CACHE[session_id] = None
-        api_key = self._get_dify_conf(context, "dify_api_key", '')
-        api_base = self._get_dify_conf(context, "dify_api_base", "https://api.dify.ai/v1")
+        api_key = self.api_key
+        api_base = self.api_base
         dify_client = DifyClient(api_key, api_base)
         msg = img_cache.get("msg")
         path = img_cache.get("path")

@@ -2,6 +2,7 @@
 channel factory
 """
 from common import const
+from config import conf
 
 
 def create_bot(bot_type):
@@ -10,10 +11,65 @@ def create_bot(bot_type):
     :param bot_type: bot type code
     :return: bot instance
     """
+    # 获取当前配置的模型
+    model = conf().get("model")
+    
+    # 如果模型是 SiliconFlow 系列模型，使用 SiliconFlowBot
+    if model in [
+        const.DEEPSEEK_V3,
+        const.DEEPSEEK_R1,
+        const.GLM_4_9B,
+        const.GLM_Z1_9B,
+        const.GLM_Z1_R_32B,
+        const.QWEN_2_7B
+    ]:
+        from bot.siliconflow.siliconflow_bot import SiliconFlowBot
+        return SiliconFlowBot()
+    
+    # 如果模型是 DeepSeek 系列模型，使用 DeepSeekBot
+    if model in [
+        const.DEEPSEEK_CHAT,
+        const.DEEPSEEK_REASONER
+    ]:
+        from bot.deepseek.deepseek_bot import DeepSeekBot
+        return DeepSeekBot()
+        
+    # 如果模型是 ZhipuAI 系列模型，使用 ZhipuAIBot
+    if model in [
+        const.GLM_4_FLASH,
+        const.GLM_4_PLUS,
+        const.GLM_Z1_FLASH
+    ]:
+        from bot.zhipuai.zhipuai_bot import ZhipuAIBot
+        return ZhipuAIBot()
+
+    # 如果模型是 Dashscope 系列模型，使用 DashscopeBot
+    if model in [
+        const.QWEN_PLUS,
+        const.QWEN_MAX,
+        const.QWEN_TURBO,
+        const.QWEN3_235B,
+        const.QWEN3_32B,
+        const.QWEN3_14B,
+        const.QWQ_PLUS,
+        const.QWEN_CHAT,
+        const.QWEN_R1
+    ]:
+        from bot.dashscope.dashscope_bot import DashscopeBot
+        return DashscopeBot()
+
+    # 如果模型是 Dify 系列模型，或者 bot_type 是 dify，使用 DifyBot
+    if model in [
+        const.DIFY_CHATBOT,
+        const.DIFY_AGENT,
+        const.DIFY_CHATFLOW,
+        const.DIFY_WORKFLOW
+    ] or bot_type == const.DIFY:
+        from bot.dify.dify_bot import DifyBot
+        return DifyBot()
+        
+    # 其他模型的处理逻辑
     if bot_type == const.BAIDU:
-        # 替换Baidu Unit为Baidu文心千帆对话接口
-        # from bot.baidu.baidu_unit_bot import BaiduUnitBot
-        # return BaiduUnitBot()
         from bot.baidu.baidu_wenxin import BaiduWenxinBot
         return BaiduWenxinBot()
 
@@ -28,7 +84,7 @@ def create_bot(bot_type):
         return OpenAIBot()
 
     elif bot_type == const.CHATGPTONAZURE:
-        # Azure chatgpt service https://azure.microsoft.com/en-in/products/cognitive-services/openai-service/
+        # Azure chatgpt service
         from bot.chatgpt.chat_gpt_bot import AzureChatGPTBot
         return AzureChatGPTBot()
 
@@ -43,46 +99,25 @@ def create_bot(bot_type):
     elif bot_type == const.CLAUDEAI:
         from bot.claude.claude_ai_bot import ClaudeAIBot
         return ClaudeAIBot()
+
     elif bot_type == const.CLAUDEAPI:
-        from bot.claudeapi.claude_api_bot import ClaudeAPIBot
+        from bot.claude.claude_ai_bot import ClaudeAPIBot
         return ClaudeAPIBot()
+
     elif bot_type == const.QWEN:
         from bot.ali.ali_qwen_bot import AliQwenBot
         return AliQwenBot()
-    elif bot_type == const.QWEN_DASHSCOPE:
-        from bot.dashscope.dashscope_bot import DashscopeBot
-        return DashscopeBot()
+        
+    elif bot_type == const.MOONSHOT:
+        from bot.moonshot.moonshot_bot import MoonshotBot
+        return MoonshotBot()
+
     elif bot_type == const.GEMINI:
         from bot.gemini.google_gemini_bot import GoogleGeminiBot
-        return GoogleGeminiBot()
-
-    elif bot_type == const.DIFY:
-        from bot.dify.dify_bot import DifyBot
-        return DifyBot()
-
-    elif bot_type == const.ZHIPU_AI:
-        from bot.zhipuai.zhipuai_bot import ZHIPUAIBot
-        return ZHIPUAIBot()
+        return GoogleGeminiBot()        
 
     elif bot_type == const.COZE:
         from bot.bytedance.bytedance_coze_bot import ByteDanceCozeBot
         return ByteDanceCozeBot()
-
-    elif bot_type == const.MOONSHOT:
-        from bot.moonshot.moonshot_bot import MoonshotBot
-        return MoonshotBot()
-    
-    elif bot_type == const.MiniMax:
-        from bot.minimax.minimax_bot import MinimaxBot
-        return MinimaxBot()
-        
-    elif bot_type == const.DEEPSEEK:
-        from bot.deepseek.deepseek_bot import DeepseekBot
-        return DeepseekBot()
-
-    elif bot_type == const.MODELSCOPE:
-        from bot.modelscope.modelscope_bot import ModelScopeBot
-        return ModelScopeBot()
-
 
     raise RuntimeError

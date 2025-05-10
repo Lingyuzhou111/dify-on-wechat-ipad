@@ -971,7 +971,12 @@ class WX849Channel(ChatChannel):
                             
                             # 创建消息对象
                             cmsg = WX849Message(msg, is_group)
-                            
+
+                            # ADDED: Call the new filter method
+                            if self._should_filter_this_message(cmsg): # 调用新的过滤方法
+                                logger.debug(f"[WX849] Message from {getattr(cmsg, 'sender_wxid', 'UnknownSender')} was filtered out by _should_filter_this_message.")
+                                continue # 如果消息被过滤，则跳过后续处理，处理下一条消息                            
+
                             # 处理消息
                             if is_group:
                                 await self.handle_group(cmsg)
@@ -1020,92 +1025,91 @@ class WX849Channel(ChatChannel):
         thread.daemon = True
         thread.start()
 
-    @_check
-    async def _handle_message(self, wx_msg: 'WX849Message'): # wx_msg type hint is 'WX849Message'
-        """处理单个接收到的消息，应用过滤规则，构建上下文并生产消息"""
+    # MODIFIED: New filter method with corrected sender ID logic for gh_ check
+    def _should_filter_this_message(self, wx_msg: 'WX849Message') -> bool:
+        # Ensure necessary imports are at the top of the file:
+        # import time
+        # from bridge.context import ContextType
+        # from config import conf
+        # from .wx849_message import WX849Message # Assuming WX849Message is in wx849_message.py
+        # logger should be defined (e.g., import logging; logger = logging.getLogger(__name__))
 
         if not wx_msg:
-            logger.debug("[WX849] Received an empty message object, ignoring.")
-            return
+            logger.debug("[WX849] Filter: Received an empty message object, ignoring.")
+            return True
 
-        _sender_wxid = getattr(wx_msg, 'sender_wxid', 'UnknownSender')
-        _content_value = getattr(wx_msg, 'content', '')
+        # Get primary identifiers from wx_msg
+        # actual_from_user_id is the direct sender (e.g., a user in private chat, a group ID, or a gh_ ID)
+        actual_from_user_id = getattr(wx_msg, 'from_user_id', '')
+        # actual_sender_wxid is specifically for the user who sent the message within a group
+        actual_sender_wxid = getattr(wx_msg, 'sender_wxid', '') 
+
+        # Determine the most relevant sender ID for general filtering/logging after the gh_ check.
+        # If actual_sender_wxid is populated (usually in groups for a specific user), it's preferred.
+        # Otherwise (e.g., private chat, or if sender_wxid wasn't parsed from group msg), use actual_from_user_id.
+        effective_sender_id = actual_sender_wxid if actual_sender_wxid else actual_from_user_id
+
+        _content_value = getattr(wx_msg, 'content', '') 
         _message_content_preview = f"(content type: {type(_content_value)}, first 50 chars: {str(_content_value)[:50]})"
-        _message_type = getattr(wx_msg, 'type', None) # In WX849Message, self.type is already a ContextType
-        _message_create_time = getattr(wx_msg, 'create_time', None) # Expected to be a Unix timestamp
+        _message_type = getattr(wx_msg, 'type', None) # wx_msg.type should be ContextType
+        _message_create_time = getattr(wx_msg, 'create_time', None)
 
         # 1. Ignore non-user messages (e.g., official accounts starting with 'gh_')
-        if isinstance(_sender_wxid, str) and _sender_wxid.startswith("gh_"):
-            logger.debug(f"[WX849] Ignored official account message from {_sender_wxid}: {_message_content_preview}")
-            return
+        #    This check specifically uses actual_from_user_id.
+        if isinstance(actual_from_user_id, str) and actual_from_user_id.startswith("gh_"):
+            logger.debug(f"[WX849] Filter: Ignored official account message from {actual_from_user_id}: {_message_content_preview}")
+            return True
+
+        # For subsequent filters, use effective_sender_id for logging and identity checks.
+        # This 'effective_sender_id' will be the actual user in a group, or the from_user_id in other cases.
 
         # 2. Ignore voice messages if speech recognition is off
         if _message_type == ContextType.VOICE:
             if conf().get("speech_recognition") != True:
-                logger.debug(f"[WX849] Ignored voice message (speech recognition off): from {_sender_wxid}")
-                return
+                logger.debug(f"[WX849] Filter: Ignored voice message (speech recognition off): from {effective_sender_id}")
+                return True
 
         # 3. Ignore messages from self (self.user_id should be the bot's own WXID)
-        if self.user_id and _sender_wxid == self.user_id:
-            logger.debug(f"[WX849] Ignored message from myself ({self.user_id}): {_message_content_preview}")
-            return
+        if self.user_id and effective_sender_id == self.user_id: 
+            logger.debug(f"[WX849] Filter: Ignored message from myself ({self.user_id}): {_message_content_preview}")
+            return True
 
         # 4. Ignore expired messages (e.g., older than 5 minutes)
         if _message_create_time:
             try:
-                # Ensure create_time is treated as a number (float or int)
                 msg_ts = float(_message_create_time)
                 current_ts = time.time()
                 if msg_ts < (current_ts - 300):  # 300 seconds = 5 minutes
-                    logger.debug(f"[WX849] Ignored expired message (timestamp: {msg_ts}) from {_sender_wxid}: {_message_content_preview}")
-                    return
-            except (ValueError, TypeError): # Handle cases where create_time might not be a valid number or string representing one
-                logger.warning(f"[WX849] Could not parse create_time '{_message_create_time}' as a number for sender {_sender_wxid}.")
-            except Exception as e: # Catch any other unexpected errors during time comparison
-                logger.warning(f"[WX849] Error checking expired message for sender {_sender_wxid}: {e}")
+                    logger.debug(f"[WX849] Filter: Ignored expired message (timestamp: {msg_ts}) from {effective_sender_id}: {_message_content_preview}")
+                    return True
+            except (ValueError, TypeError):
+                logger.warning(f"[WX849] Filter: Could not parse create_time '{_message_create_time}' for sender {effective_sender_id}.")
+            except Exception as e: 
+                logger.warning(f"[WX849] Filter: Error checking expired message for sender {effective_sender_id}: {e}")
         
-        # 5. Ignore status sync messages (similar to gewechat)
-        if _message_type == ContextType.STATUS_SYNC:
-            logger.debug(f"[WX849] Ignored status sync message from {_sender_wxid}: {_message_content_preview}")
-            return
-        # Filter rules end
-
-        # Check if message has already been processed (to avoid duplicates)
-        # This is an existing part of the logic, ensure it's still here after the filters.
+        # 5. Ignore status sync messages
+        if hasattr(ContextType, 'STATUS_SYNC') and _message_type == ContextType.STATUS_SYNC:
+            logger.debug(f"[WX849] Filter: Ignored status sync message from {effective_sender_id}: {_message_content_preview}")
+            return True
+        
+        # Duplicate message check
+        # Use effective_sender_id for the duplicate key to ensure uniqueness.
         if wx_msg and hasattr(wx_msg, 'msg_id') and wx_msg.msg_id:
-            wx_msg_key = f"{wx_msg.msg_id}_{wx_msg.sender_wxid}_{wx_msg.create_time}"
-            if wx_msg_key in self.received_msgs:
-                logger.debug(f"[WX849] 已处理的消息，跳过: {wx_msg_key}")
-                return
-            self.received_msgs[wx_msg_key] = wx_msg  # Mark as processed
-        else:
-            logger.debug("[WX849] Message does not have a unique msg_id for duplicate checking, proceeding with caution.")
-        
-        logger.debug(f"[WX849] Message from {wx_msg.sender_wxid} passed filters, proceeding to compose context. Type: {wx_msg.type}, Content: {_message_content_preview}")
-
-        try:
-            ctype = wx_msg.type
-            content = wx_msg.content
-
-            context = self._compose_context(
-                ctype,
-                content,
-                isgroup=wx_msg.is_group,
-                msg=wx_msg,
-                actual_user_id=wx_msg.actual_user_id, # actual_user_id is important for group messages
-                from_user_id=wx_msg.sender_wxid,      # from_user_id (sender in group or private chat)
-                to_user_id=self.user_id,              # to_user_id (usually the bot itself)
-                other_user_id=wx_msg.other_user_id    # other_user_id (group_id if group, or sender if private)
-            )
-            if context:
-                logger.debug(f"[WX849] Context composed: {context}")
-                self.produce(context)
+            # Ensure received_msgs is initialized in WX849Channel.__init__
+            # e.g., self.received_msgs = ExpiredDict(conf().get("expires_in_seconds", 3600))
+            if not hasattr(self, 'received_msgs'):
+                 logger.error("[WX849] Filter: self.received_msgs is not initialized. Cannot check for duplicates.")
             else:
-                logger.warning("[WX849] Failed to compose context from wx_msg.")
-        except Exception as e:
-            logger.error(f"[WX849] Error in _handle_message after filters: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+                wx_msg_key = f"{wx_msg.msg_id}_{effective_sender_id}_{wx_msg.create_time}"
+                if wx_msg_key in self.received_msgs: 
+                    logger.debug(f"[WX849] Filter: Ignored duplicate message: {wx_msg_key}")
+                    return True
+                self.received_msgs[wx_msg_key] = wx_msg
+        else:
+            logger.debug("[WX849] Filter: Message lacks unique msg_id for duplicate check, proceeding with caution.")
+        
+        return False # Message passed all filters
+
 
     @_check
     async def handle_single(self, cmsg: ChatMessage):
@@ -3789,19 +3793,6 @@ class WX849Channel(ChatChannel):
             else:
                 logger.warning(f"[WX849] 发送App XML消息可能失败: 接收者: {receiver}, Type: {app_type}, 结果: {result}")
 
-        # 移除不存在的ReplyType.Emoji类型处理
-        # elif reply.type == ReplyType.Emoji:
-        #     emoji_input = reply.content
-        #     # 移除 os.path.exists 检查，交由 _send_emoji 处理
-        #     # 使用我们的自定义方法发送表情
-        #     result = loop.run_until_complete(self._send_emoji(receiver, emoji_input))
-        #     
-        #     if result and isinstance(result, dict) and result.get("Success", False):
-        #         logger.info(f"[WX849] 发送表情成功: 接收者: {receiver}")
-        #     else:
-        #         logger.warning(f"[WX849] 发送表情可能失败: 接收者: {receiver}, 结果: {result}")
-        
-        # 移除不存在的ReplyType.App类型，改用ReplyType.MINIAPP
         elif reply.type == ReplyType.MINIAPP:
             app_input = reply.content
             # 移除 os.path.exists 检查，交由 _send_app 处理

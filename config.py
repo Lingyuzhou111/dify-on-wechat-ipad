@@ -23,11 +23,29 @@ available_setting = {
     "open_ai_api_base": "https://api.openai.com/v1",
     "proxy": "",  # openai使用的代理
     # chatgpt模型， 当use_azure_chatgpt为true时，其名称为Azure上model deployment名称
-    "model": "gpt-3.5-turbo",  # 可选择: gpt-4o, pt-4o-mini, gpt-4-turbo, claude-3-sonnet, wenxin, moonshot, qwen-turbo, xunfei, glm-4, minimax, gemini等模型，全部可选模型详见common/const.py文件
+    "model": "对话模型 [openAI, chatGPT, wenxin, xunfei, zhipuai, claude, qwen, dashscope, gemini, moonshot, coze, dify, deepseek，siliconflow]",   # 可选择: gpt-4o, pt-4o-mini, gpt-4-turbo, claude-3-sonnet, wenxin, moonshot, qwen-turbo, xunfei, glm-4, minimax, gemini等模型，全部可选模型详见common/const.py文件
     "bot_type": "",  # 可选配置，使用兼容openai格式的三方服务时候，需填"chatGPT"。bot具体名称详见common/const.py文件列出的bot_type，如不填根据model名称判断，
     "use_azure_chatgpt": False,  # 是否使用azure的chatgpt
     "azure_deployment_id": "",  # azure 模型部署名称
     "azure_api_version": "",  # azure api版本
+    # DeepSeek API配置
+    "deepseek_api_key": "",    # DeepSeek API key
+    "deepseek_api_base": "https://api.deepseek.com/v1",  # DeepSeek API base URL
+    "deepseek_model": "deepseek-chat",  # DeepSeek 模型名称
+    # Siliconflow API配置    
+    "siliconflow_api_key": "", # 硅基流动 API key
+    "siliconflow_api_base": "https://api.siliconflow.cn/v1/chat/completions",
+    "siliconflow_model": "Qwen/Qwen2.5-7B-Instruct",  # SiliconFlow 默认模型    
+
+    # wx849配置
+    "wx849_api_host": "127.0.0.1",  # wx849 channel API host
+    "wx849_api_port": 9011,         # wx849 channel API port
+    "wx849_protocol_version": "849", # wx849 channel protocol version 
+    "log_level": "INFO",                 # 日志级别, 可选 "DEBUG", "INFO", "WARNING", "ERROR"
+    "wx849_callback_host": "127.0.0.1",  # WX849 channel 回调监听主机
+    "wx849_callback_port": 9919,       # WX849 channel 回调监听端口 (根据实际需要和代码确认是否添加)
+    "wx849_callback_key": "",  # WX849回调接口的验证密钥，默认为空字符串    
+
     # Bot触发配置
     "single_chat_prefix": ["bot", "@bot"],  # 私聊时文本需要包含该前缀才能触发机器人回复
     "single_chat_reply_prefix": "[bot] ",  # 私聊时自动回复的前缀，用于区分真人
@@ -62,6 +80,7 @@ available_setting = {
     "accept_friend_msg": "",  # 接受好友请求后发送的消息
     # chatgpt会话参数
     "expires_in_seconds": 3600,  # 无操作会话的过期时间
+    "image_expires_in_seconds": 7200,  # 图片消息缓存过期时间（秒）
     # 人格描述
     "character_desc": "你是ChatGPT, 一个由OpenAI训练的大型语言模型, 你旨在回答并解决人们的任何问题，并且可以使用多种语言与人交流。",
     "conversation_max_tokens": 1000,  # 支持上下文记忆的最多字符数
@@ -104,7 +123,7 @@ available_setting = {
     # dify配置
     "dify_api_base": "https://api.dify.ai/v1",
     "dify_api_key": "app-xxx",
-    "dify_app_type": "chatbot", # dify助手类型 chatbot(对应聊天助手或对话流)/agent(对应Agent)/workflow(对应工作流，则默认为chatbot
+    "dify_app_type": "chatflow", # dify助手类型 chatbot(对应聊天助手或对话流)/agent(对应Agent)/workflow(对应工作流，则默认为chatbot
     "dify_conversation_max_messages": 5, # dify目前不支持设置历史消息长度，暂时使用超过最大消息数清空会话的策略，缺点是没有滑动窗口，会突然丢失历史消息，当设置的值小于等于0，则不限制历史消息长度
     "dify_error_reply": "", # dify bot错误时给用户的回复
     # coze配置
@@ -112,7 +131,6 @@ available_setting = {
     "coze_api_key": "xxx",
     "coze_bot_id": "xxx",
     "coze_return_show_img": "false",
-    "coze_conversation_max_messages" : 20, # coze目前不支持设置历史消息长度，暂时使用超过最大消息数清空会话的策略，缺点是没有滑动窗口，会突然丢失历史消息
     # wework的通用配置
     "wework_smart": True,  # 配置wework是否使用已登录的企业微信，False为多开
     # 语音设置
@@ -135,7 +153,7 @@ available_setting = {
     "azure_voice_region": "japaneast",
     # elevenlabs 语音api配置
     "xi_api_key": "",    #获取ap的方法可以参考https://docs.elevenlabs.io/api-reference/quick-start/authentication
-    "xi_voice_id": "",   #ElevenLabs提供了9种英式、美式等英语发音id，分别是“Adam/Antoni/Arnold/Bella/Domi/Elli/Josh/Rachel/Sam”
+    "xi_voice_id": "",   #ElevenLabs提供了9种英式、美式等英语发音id，分别是"Adam/Antoni/Arnold/Bella/Domi/Elli/Josh/Rachel/Sam"
     # 图像模型设置
     "image_recognition": False, # 是否开启图片识别
     # 服务时间限制，目前支持itchat
@@ -182,15 +200,6 @@ available_setting = {
     "gewechat_app_id": "",
     "gewechat_callback_url": "", # 回调地址，示例：http://172.17.0.1:9919/v2/api/callback/collect
     
-    # 微信849协议配置
-    "wx849_api_host": "127.0.0.1",  # 微信849协议API地址
-    "wx849_api_port": 9000,  # 微信849协议API端口
-    "wx849_protocol_version": "849",  # 微信849协议版本，可选: "849", "855", "ipad"
-    "log_level": "INFO",
-    "wx849_wxid": "",
-    "wx849_device_name": "DoW微信机器人",
-    "wx849_device_id": "",
-
     # chatgpt指令自定义触发词
     "clear_memory_commands": ["#清除记忆"],  # 重置会话指令，必须以#开头
     # channel配置
@@ -205,13 +214,12 @@ available_setting = {
     "max_media_send_count": 3,  # 单次最大发送媒体资源的个数
     "media_send_interval": 1,  # 发送图片的事件间隔，单位秒
     # 智谱AI 平台配置
-    "zhipu_ai_api_key": "",
-    "zhipu_ai_api_base": "https://open.bigmodel.cn/api/paas/v4",
+    "zhipuai_model": "智谱AI模型 [glm-4v-plus(支持多图和视频), glm-4v-flash(仅支持单图)]",
+    "zhipu_ai_api_key": "",  # 智谱AI API密钥
+    "zhipu_ai_api_base": "https://open.bigmodel.cn/api/paas/v4",  # 智谱AI API地址
+    # Kimi平台配置
     "moonshot_api_key": "",
     "moonshot_base_url": "https://api.moonshot.cn/v1/chat/completions",
-    #魔搭社区 平台配置
-    "modelscope_api_key": "",
-    "modelscope_base_url": "https://api-inference.modelscope.cn/v1/chat/completions",
     # LinkAI平台配置
     "use_linkai": False,
     "linkai_api_key": "",

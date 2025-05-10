@@ -1,6 +1,6 @@
 # DoW-849 微信机器人
 
-基于WX849协议的Dify-on-wechat项目，原版由An cool创建，此版本为本人自用版，已修复大部分已知bug。
+基于WX849协议的Dify-on-wechat项目，原版由An cool创建，此版本为本人自用版，已修复大部分已知bug（图片上传、XML消息发送和识别、语音发送等）。
 原版链接：https://github.com/AnCool-OvO/dify-on-wechat-ipad
 
 ## 功能特点

@@ -1,12 +1,13 @@
 # DoW-849 微信机器人
 
-基于WX849协议的Dify AI微信接入方案，支持私聊、群聊、图片识别、语音识别等功能（还在实验中，bug较多许多功能暂不可用）。
+基于WX849协议的Dify-on-wechat项目，原版由An cool创建，此版本为本人自用版，已修复大部分已知bug。
+原版链接：https://github.com/AnCool-OvO/dify-on-wechat-ipad
 
 ## 功能特点
 
 - **多种协议支持**: 支持849(iPad)
 - **高稳定性**: 基于成熟的WX849协议，连接稳定，功能丰富
-- **多样化交互**: 支持文本、图片、语音、文件等多种消息类型
+- **多样化交互**: 支持文本、图片、语音、卡片等多种消息类型
 - **智能对话**: 对接Dify API，提供智能对话服务
 - **灵活配置**: 支持白名单、黑名单等多样化配置
 
@@ -15,12 +16,6 @@
 - Python 3.11+
 - Redis
 - Windows 10/11、Linux或macOS
-
-## 交流群
-
-欢迎进入交流群进行相互讨论学习
-
- <img src="https://github.com/AnCool-OvO/dify-on-wechat-ipad/blob/master/images/qr.jpg" width="300">
 
 ## 安装步骤
 

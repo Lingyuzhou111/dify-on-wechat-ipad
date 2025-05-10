@@ -17,6 +17,7 @@ class ReplyType(Enum):
     TEXT_ = 11  # 强制文本
     VIDEO = 12
     MINIAPP = 13  # 小程序
+    APP = 14  # 音乐分享卡片
     ACCEPT_FRIEND = 19 # 接受好友申请
 
     def __str__(self):

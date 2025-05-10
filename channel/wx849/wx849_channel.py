@@ -8,7 +8,10 @@ import sys
 import traceback  # 添加traceback模块导入
 import xml.etree.ElementTree as ET  # 在顶部添加ET导入
 import math  # 导入数学模块，用于ceil函数
-from typing import Dict, Any
+import base64  # 添加base64模块导入
+import imghdr  # 添加imghdr模块导入
+from typing import Dict, Any, Optional
+from PIL import Image  # 添加PIL导入
 
 import requests
 from bridge.context import Context, ContextType  # 确保导入Context类
@@ -2125,30 +2128,115 @@ class WX849Channel(ChatChannel):
             logger.error(f"[WX849] 发送消息失败: {e}")
             return None
 
-    async def _send_image(self, to_user_id, image_input):
-        """发送图片的异步方法 (处理文件路径或BytesIO/bytes)"""
+    async def _send_image(self, to_user_id, image_input, context=None):
+        """发送图片
+        
+        Args:
+            to_user_id: 接收者wxid
+            image_input: 图片输入，支持文件路径/BytesIO/bytes/BufferedReader
+            context: 上下文信息，包含更多发送相关的参数
+            
+        Returns:
+            dict: API响应结果
+        """
         try:
-            # 检查接收者ID
+            # 从上下文中获取更准确的接收者ID
+            if context and "receiver" in context:
+                to_user_id = context["receiver"]
+                logger.debug(f"[WX849] 从上下文中获取接收者ID: {to_user_id}")
+            
+            # 如果接收者为空，返回None
             if not to_user_id:
-                logger.error("[WX849] 发送图片失败: 接收者ID为空")
+                logger.error(f"[WX849] 发送图片失败: 接收者为空")
                 return None
-            
+
+            # 初始化图片base64变量
             image_base64 = None
-            import base64
             
-            if isinstance(image_input, str): # 如果是文件路径字符串
-                if not os.path.exists(image_input):
-                    logger.error(f"[WX849] 发送图片失败: 文件不存在 {image_input}")
+            # 根据不同的输入类型处理图片数据
+            if isinstance(image_input, str):
+                # 字符串类型，判断是文件路径还是Base64
+                if os.path.exists(image_input):
+                    with open(image_input, 'rb') as f:
+                        image_data = f.read()
+                    
+                    # 检查大小并决定是否压缩
+                    if len(image_data) > 5 * 1024 * 1024:  # 如果大于5MB
+                        logger.info(f"[WX849] 图片大小为 {len(image_data)/1024/1024:.2f}MB，尝试压缩")
+                        try:
+                            compressed_data = self._compress_image(image_data, max_size=4*1024*1024)
+                            image_base64 = base64.b64encode(compressed_data).decode('utf-8')
+                        except Exception as e:
+                            logger.error(f"[WX849] 压缩图片失败: {e}")
+                            # 失败后回退到原始数据
+                            image_base64 = base64.b64encode(image_data).decode('utf-8')
+                    else:
+                        image_base64 = base64.b64encode(image_data).decode('utf-8')
+                else:
+                    logger.error(f"[WX849] 发送图片失败: 图片文件不存在 {image_input}")
                     return None
-                with open(image_input, "rb") as f:
-                    image_data = f.read()
-                    image_base64 = base64.b64encode(image_data).decode('utf-8')
+            
             elif isinstance(image_input, io.BytesIO):
-                image_data = image_input.getvalue()
-                image_base64 = base64.b64encode(image_data).decode('utf-8')
+                # BytesIO类型，直接获取所有数据
+                image_input.seek(0)
+                image_data = image_input.read()
+                
+                # 检查大小并决定是否压缩
+                if len(image_data) > 5 * 1024 * 1024:  # 如果大于5MB
+                    logger.info(f"[WX849] 图片大小为 {len(image_data)/1024/1024:.2f}MB，尝试压缩")
+                    try:
+                        compressed_data = self._compress_image(image_data, max_size=4*1024*1024)
+                        image_base64 = base64.b64encode(compressed_data).decode('utf-8')
+                    except Exception as e:
+                        logger.error(f"[WX849] 压缩图片失败: {e}")
+                        # 失败后回退到原始数据
+                        image_base64 = base64.b64encode(image_data).decode('utf-8')
+                else:
+                    image_base64 = base64.b64encode(image_data).decode('utf-8')
+                
             elif isinstance(image_input, bytes):
                 image_data = image_input
-                image_base64 = base64.b64encode(image_data).decode('utf-8')
+                # 检查大小并决定是否压缩
+                if len(image_data) > 5 * 1024 * 1024:  # 如果大于5MB
+                    logger.info(f"[WX849] 图片大小为 {len(image_data)/1024/1024:.2f}MB，尝试压缩")
+                    try:
+                        compressed_data = self._compress_image(image_data, max_size=4*1024*1024)
+                        image_base64 = base64.b64encode(compressed_data).decode('utf-8')
+                    except Exception as e:
+                        logger.error(f"[WX849] 压缩图片失败: {e}")
+                        # 失败后回退到原始数据
+                        image_base64 = base64.b64encode(image_data).decode('utf-8')
+                else:
+                    image_base64 = base64.b64encode(image_data).decode('utf-8')
+            
+            elif hasattr(image_input, 'read') and callable(image_input.read):
+                # 新增 BufferedReader 或其他文件类对象的处理 (任何有read方法的对象)
+                try:
+                    # 保存当前位置
+                    current_pos = image_input.tell()
+                    # 重置到开始
+                    image_input.seek(0)
+                    # 读取所有数据
+                    image_data = image_input.read()
+                    # 恢复位置
+                    image_input.seek(current_pos)
+                    
+                    # 检查大小并决定是否压缩
+                    if len(image_data) > 5 * 1024 * 1024:  # 如果大于5MB
+                        logger.info(f"[WX849] 图片大小为 {len(image_data)/1024/1024:.2f}MB，尝试压缩")
+                        try:
+                            compressed_data = self._compress_image(image_data, max_size=4*1024*1024)
+                            image_base64 = base64.b64encode(compressed_data).decode('utf-8')
+                        except Exception as e:
+                            logger.error(f"[WX849] 压缩图片失败: {e}")
+                            # 失败后回退到原始数据
+                            image_base64 = base64.b64encode(image_data).decode('utf-8')
+                    else:
+                        image_base64 = base64.b64encode(image_data).decode('utf-8')
+                except Exception as e:
+                    logger.error(f"[WX849] 读取文件对象失败: {e}")
+                    return None
+            
             else:
                 logger.error(f"[WX849] 发送图片失败: 不支持的图片输入类型 {type(image_input)}")
                 return None
@@ -2156,24 +2244,392 @@ class WX849Channel(ChatChannel):
             # 构建API参数
             params = {
                 "ToWxid": to_user_id,
-                "Base64": image_base64, # 修改参数名为 Base64
+                "Base64": image_base64, # 参数名为 Base64
                 "Wxid": self.wxid
             }
             
-            # 调用API，修改端点为 /Msg/UploadImg
-            result = await self._call_api("/Msg/UploadImg", params) 
+            # 添加调试日志
+            logger.debug(f"[WX849] 正在发送图片到: {to_user_id}, 图片大小: {len(image_base64)/1024:.2f}KB (Base64编码后)")
+            
+            # 调用API
+            result = await self._call_api("/Msg/UploadImg", params)
             
             # 检查结果
             if result and isinstance(result, dict):
                 success = result.get("Success", False)
-                if not success:
+                if success:
+                    logger.info(f"[WX849] 发送图片成功: 接收者: {to_user_id}")
+                else:
                     error_msg = result.get("Message", "未知错误")
                     logger.error(f"[WX849] 发送图片API返回错误: {error_msg}")
             
             return result
         except Exception as e:
             logger.error(f"[WX849] 发送图片失败: {e}")
+            logger.error(traceback.format_exc())  # 输出详细错误堆栈
             return None
+    
+    def _compress_image(self, image_data, max_size=4*1024*1024, quality=85):
+        """压缩图片，确保大小不超过指定限制
+        
+        Args:
+            image_data: 图片数据(bytes)
+            max_size: 最大允许大小(字节)，默认4MB
+            quality: 初始图片质量，会根据需要降低
+            
+        Returns:
+            bytes: 压缩后的图片数据
+        """
+        try:
+            # 创建一个BytesIO对象来存储图片
+            img_io = io.BytesIO(image_data)
+            
+            # 打开图片
+            with Image.open(img_io) as img:
+                # 保存初始格式
+                img_format = img.format if img.format else 'JPEG'
+                
+                # 检查图片格式
+                if img_format == 'GIF':
+                    logger.debug("[WX849] 检测到GIF图片，不进行压缩")
+                    return image_data  # GIF不进行压缩
+                    
+                # 如果是WebP格式，先转换为PNG
+                if img_format == 'WEBP':
+                    logger.debug("[WX849] 检测到WebP图片，转换为PNG")
+                    img_format = 'PNG'
+                
+                # 检查图片尺寸
+                width, height = img.size
+                
+                # 如果图片特别大，先缩放尺寸
+                max_dimension = 2048
+                if width > max_dimension or height > max_dimension:
+                    logger.debug(f"[WX849] 图片尺寸过大 ({width}x{height})，进行缩放")
+                    # 计算缩放比例
+                    ratio = min(max_dimension / width, max_dimension / height)
+                    new_width = int(width * ratio)
+                    new_height = int(height * ratio)
+                    # 缩放图片
+                    img = img.resize((new_width, new_height), Image.LANCZOS)
+                    logger.debug(f"[WX849] 图片已缩放至 {new_width}x{new_height}")
+                
+                # 初始质量
+                current_quality = quality
+                output = io.BytesIO()
+                
+                # 尝试不同的压缩质量直到满足大小要求
+                while current_quality > 20:  # 最低质量限制
+                    output.seek(0)
+                    output.truncate(0)
+                    
+                    # 保存图片
+                    if img_format == 'JPEG' or img_format == 'JPG':
+                        img.save(output, format='JPEG', quality=current_quality, optimize=True)
+                    elif img_format == 'PNG':
+                        img.save(output, format='PNG', optimize=True)
+                    else:
+                        img.save(output, format=img_format)
+                    
+                    # 检查大小
+                    size = output.tell()
+                    if size <= max_size:
+                        logger.debug(f"[WX849] 图片压缩成功: {size/1024/1024:.2f}MB, 质量={current_quality}")
+                        break
+                    
+                    # 减小质量
+                    current_quality -= 10
+                
+                # 如果压缩后仍然太大，使用更激进的缩放
+                if output.tell() > max_size:
+                    logger.debug("[WX849] 质量压缩不够，使用更激进的尺寸缩放")
+                    # 计算需要的尺寸缩放比例
+                    scale_factor = math.sqrt(max_size / output.tell()) * 0.9  # 留一些余量
+                    
+                    new_width = int(width * scale_factor)
+                    new_height = int(height * scale_factor)
+                    
+                    # 确保尺寸不会太小
+                    if new_width < 300 or new_height < 300:
+                        logger.warning("[WX849] 压缩后图片尺寸太小，使用原始图片")
+                        return image_data
+                    
+                    # 缩放图片
+                    img = img.resize((new_width, new_height), Image.LANCZOS)
+                    
+                    output.seek(0)
+                    output.truncate(0)
+                    
+                    # 保存图片
+                    if img_format == 'JPEG' or img_format == 'JPG':
+                        img.save(output, format='JPEG', quality=70, optimize=True)
+                    elif img_format == 'PNG':
+                        img.save(output, format='PNG', optimize=True)
+                    else:
+                        img.save(output, format=img_format)
+                    
+                    logger.debug(f"[WX849] 图片缩放压缩后: {output.tell()/1024/1024:.2f}MB, 尺寸={new_width}x{new_height}")
+                
+                # 返回压缩后的图片数据
+                return output.getvalue()
+                
+        except Exception as e:
+            logger.error(f"[WX849] 压缩图片失败: {e}")
+            logger.error(traceback.format_exc())
+            # 出错时返回原始图片
+            return image_data
+    
+    def download_image(self, msg_id, group_id=None):
+        """下载图片，供外部调用
+        
+        Args:
+            msg_id: 消息ID
+            group_id: 群ID，如果是群消息
+            
+        Returns:
+            str: 图片文件路径，如果下载失败则返回None
+        """
+        logger.debug(f"[WX849] 尝试下载图片: msg_id={msg_id}, group_id={group_id}")
+        
+        # 创建临时目录
+        tmp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp", "images")
+        os.makedirs(tmp_dir, exist_ok=True)
+        
+        # 生成图片文件名
+        image_filename = f"img_{msg_id}_{int(time.time())}.jpg"
+        image_path = os.path.join(tmp_dir, image_filename)
+        
+        # 检查是否已经存在相同的图片文件
+        existing_files = [f for f in os.listdir(tmp_dir) if f.startswith(f"img_{msg_id}_")]
+        if existing_files:
+            # 找到最新的文件
+            latest_file = sorted(existing_files, key=lambda x: os.path.getmtime(os.path.join(tmp_dir, x)), reverse=True)[0]
+            existing_path = os.path.join(tmp_dir, latest_file)
+            
+            # 检查文件是否有效
+            if os.path.exists(existing_path) and os.path.getsize(existing_path) > 0:
+                logger.debug(f"[WX849] 找到已存在的图片文件: {existing_path}")
+                return existing_path
+        
+        # 构建API请求参数
+        api_host = conf().get("wx849_api_host", "127.0.0.1")
+        api_port = conf().get("wx849_api_port", 9000)
+        protocol_version = conf().get("wx849_protocol_version", "849")
+        
+        # 确定API路径前缀
+        if protocol_version == "855" or protocol_version == "ipad":
+            api_path_prefix = "/api"
+        else:
+            api_path_prefix = "/VXAPI"
+        
+        # 估计图片大小或使用默认值
+        data_len = 345519  # 默认大小
+        
+        # 分段大小
+        chunk_size = 65536  # 64KB
+        
+        # 计算分段数
+        num_chunks = (data_len + chunk_size - 1) // chunk_size
+        if num_chunks <= 0:
+            num_chunks = 1  # 至少分1段
+        
+        logger.info(f"[WX849] 开始分段下载图片，总大小: {data_len} 字节，分 {num_chunks} 段下载")
+        
+        # 创建一个空文件
+        with open(image_path, "wb") as f:
+            pass
+        
+        # 分段下载
+        all_chunks_success = True
+        for i in range(num_chunks):
+            start_pos = i * chunk_size
+            current_chunk_size = min(chunk_size, data_len - start_pos)
+            if current_chunk_size <= 0:
+                current_chunk_size = chunk_size
+            
+            # 构建API请求参数
+            params = {
+                "MsgId": msg_id,
+                "ToWxid": group_id if group_id else "filehelper",
+                "Wxid": self.wxid,
+                "DataLen": data_len,
+                "CompressType": 0,
+                "Section": {
+                    "StartPos": start_pos,
+                    "DataLen": current_chunk_size
+                }
+            }
+            
+            logger.debug(f"[WX849] 尝试下载图片分段: MsgId={msg_id}, DataLen={data_len}, StartPos={start_pos}, ChunkSize={current_chunk_size}")
+            
+            # 构建完整的API URL
+            api_url = f"http://{api_host}:{api_port}{api_path_prefix}/Tools/DownloadImg"
+            
+            try:
+                # 使用同步请求 - 创建事件循环
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                try:
+                    # 创建API调用任务
+                    task = self._call_api("/Tools/DownloadImg", params)
+                    result = loop.run_until_complete(task)
+                finally:
+                    loop.close()
+                
+                if not result or not isinstance(result, dict) or not result.get("Success", False):
+                    error_msg = result.get("Message", "未知错误") if result and isinstance(result, dict) else "未知错误"
+                    logger.error(f"[WX849] 下载图片分段失败: {error_msg}")
+                    all_chunks_success = False
+                    break
+                
+                # 提取图片数据
+                data = result.get("Data", {})
+                
+                # 尝试不同的响应格式
+                chunk_base64 = None
+                
+                # 如果是字典，尝试获取buffer字段
+                if isinstance(data, dict):
+                    if "buffer" in data:
+                        logger.debug(f"[WX849] 从data.buffer字段获取图片数据")
+                        chunk_base64 = data.get("buffer")
+                    elif "data" in data and isinstance(data["data"], dict) and "buffer" in data["data"]:
+                        logger.debug(f"[WX849] 从data.data.buffer字段获取图片数据")
+                        chunk_base64 = data["data"]["buffer"]
+                    else:
+                        # 尝试其他可能的字段名
+                        for field in ["Chunk", "Image", "Data", "FileData", "data"]:
+                            if field in data:
+                                logger.debug(f"[WX849] 从data.{field}字段获取图片数据")
+                                chunk_base64 = data.get(field)
+                                break
+                elif isinstance(data, str):
+                    # 如果直接返回字符串，可能就是base64数据
+                    logger.debug(f"[WX849] Data字段是字符串，直接使用")
+                    chunk_base64 = data
+                
+                # 如果在data中没有找到，尝试在整个响应中查找
+                if not chunk_base64 and isinstance(result, dict):
+                    for field in ["data", "Data", "FileData", "Image"]:
+                        if field in result:
+                            logger.debug(f"[WX849] 从result.{field}字段获取图片数据")
+                            chunk_base64 = result.get(field)
+                            break
+                
+                if not chunk_base64:
+                    logger.error(f"[WX849] 下载图片分段失败: 响应中无图片数据")
+                    all_chunks_success = False
+                    break
+                
+                # 解码数据并保存图片分段
+                try:
+                    # 尝试确定数据类型并正确处理
+                    if isinstance(chunk_base64, str):
+                        # 尝试作为Base64解码
+                        try:
+                            # 确保字符串是有效的Base64
+                            clean_base64 = chunk_base64.strip()
+                            # 确保长度是4的倍数，如果不是，添加填充
+                            padding = 4 - (len(clean_base64) % 4) if len(clean_base64) % 4 != 0 else 0
+                            clean_base64 = clean_base64 + ('=' * padding)
+                            
+                            chunk_data = base64.b64decode(clean_base64)
+                            logger.debug(f"[WX849] 成功解码Base64数据，大小: {len(chunk_data)} 字节")
+                        except Exception as decode_err:
+                            logger.error(f"[WX849] Base64解码失败: {decode_err}")
+                            all_chunks_success = False
+                            break
+                    elif isinstance(chunk_base64, bytes):
+                        # 已经是二进制数据，直接使用
+                        logger.debug(f"[WX849] 使用二进制数据，大小: {len(chunk_base64)} 字节")
+                        chunk_data = chunk_base64
+                    else:
+                        logger.error(f"[WX849] 未知数据类型: {type(chunk_base64)}")
+                        all_chunks_success = False
+                        break
+                    
+                    # 追加到文件
+                    with open(image_path, "ab") as f:
+                        f.write(chunk_data)
+                    logger.debug(f"[WX849] 第 {i+1}/{num_chunks} 段下载成功，大小: {len(chunk_data)} 字节")
+                except Exception as decode_err:
+                    logger.error(f"[WX849] 解码Base64图片分段数据失败: {decode_err}")
+                    all_chunks_success = False
+                    break
+            except Exception as api_err:
+                logger.error(f"[WX849] 调用图片分段API失败: {api_err}")
+                all_chunks_success = False
+                break
+        
+        if all_chunks_success:
+            # 检查文件大小
+            file_size = os.path.getsize(image_path)
+            logger.info(f"[WX849] 分段下载图片成功，总大小: {file_size} 字节")
+            
+            # 检查文件是否存在且有效
+            if os.path.exists(image_path) and os.path.getsize(image_path) > 0:
+                # 验证图片文件是否为有效的图片格式
+                try:
+                    from PIL import Image
+                    try:
+                        # 尝试打开图片文件
+                        with Image.open(image_path) as img:
+                            # 获取图片格式和大小
+                            img_format = img.format
+                            img_size = img.size
+                            logger.info(f"[WX849] 图片验证成功: 格式={img_format}, 大小={img_size}")
+                            return image_path
+                    except Exception as img_err:
+                        logger.error(f"[WX849] 图片验证失败，可能不是有效的图片文件: {img_err}")
+                except ImportError:
+                    # 如果PIL库未安装，假设文件有效
+                    if os.path.getsize(image_path) > 10000:  # 至少10KB
+                        logger.info(f"[WX849] 图片下载完成，保存到: {image_path}")
+                        return image_path
+        
+        # 如果下载失败，删除可能存在的不完整文件
+        if os.path.exists(image_path):
+            try:
+                os.remove(image_path)
+            except Exception as e:
+                logger.error(f"[WX849] 删除不完整的图片文件失败: {e}")
+        
+        return None
+        
+    def _convert_webp_to_png(self, webp_data):
+        """将WebP格式转换为PNG格式
+        
+        Args:
+            webp_data: WebP图片数据(bytes或BytesIO)
+            
+        Returns:
+            BytesIO: 转换后的PNG图片
+        """
+        try:
+            if isinstance(webp_data, io.BytesIO):
+                webp_data.seek(0)
+                image = Image.open(webp_data)
+            else:
+                image = Image.open(io.BytesIO(webp_data))
+            
+            # 创建一个新的BytesIO对象来存储PNG图片
+            png_data = io.BytesIO()
+            
+            # 转换并保存为PNG
+            image.save(png_data, format="PNG")
+            png_data.seek(0)
+            
+            logger.debug(f"[WX849] WebP转换为PNG成功")
+            return png_data
+        except Exception as e:
+            logger.error(f"[WX849] WebP转换为PNG失败: {e}")
+            # 出错时返回原始数据
+            if isinstance(webp_data, io.BytesIO):
+                webp_data.seek(0)
+                return webp_data
+            else:
+                return io.BytesIO(webp_data)
 
     async def _send_video(self, to_user_id, video_details):
         """发送视频的异步方法
@@ -2379,8 +2835,36 @@ class WX849Channel(ChatChannel):
                     for block in pic_res.iter_content(1024):
                         f.write(block)
                 
-                # 使用我们的自定义方法发送图片
-                result = loop.run_until_complete(self._send_image(receiver, tmp_path))
+                # 检查文件类型，特殊处理WebP
+                img_type = imghdr.what(tmp_path)
+                if img_type == 'webp':
+                    logger.debug(f"[WX849] 检测到WebP格式图片，尝试转换为PNG")
+                    try:
+                        with open(tmp_path, 'rb') as f:
+                            webp_data = f.read()
+                        
+                        # 转换WebP为PNG
+                        png_data = self._convert_webp_to_png(webp_data)
+                        
+                        # 保存PNG图片
+                        png_path = os.path.join(get_appdata_dir(), f"tmp_img_{int(time.time())}.png")
+                        with open(png_path, 'wb') as f:
+                            f.write(png_data.getvalue())
+                        
+                        # 删除原始WebP文件
+                        try:
+                            os.remove(tmp_path)
+                        except Exception as e:
+                            logger.debug(f"[WX849] 删除临时WebP文件失败: {e}")
+                        
+                        # 使用转换后的PNG文件
+                        tmp_path = png_path
+                        logger.debug(f"[WX849] WebP已转换为PNG: {tmp_path}")
+                    except Exception as e:
+                        logger.error(f"[WX849] WebP转换失败: {e}，将使用原始文件")
+                
+                # 使用我们的自定义方法发送图片，传递上下文参数
+                result = loop.run_until_complete(self._send_image(receiver, tmp_path, context))
                 
                 if result and isinstance(result, dict) and result.get("Success", False):
                     logger.info(f"[WX849] 发送图片成功: 接收者: {receiver}")
@@ -2394,12 +2878,13 @@ class WX849Channel(ChatChannel):
                     logger.debug(f"[WX849] 删除临时图片文件失败: {e}")
             except Exception as e:
                 logger.error(f"[WX849] 发送图片失败: {e}")
+                logger.error(traceback.format_exc())
         
         elif reply.type == ReplyType.IMAGE: # 添加处理 ReplyType.IMAGE
             image_input = reply.content
             # 移除 os.path.exists 检查，交由 _send_image 处理
-            # 使用我们的自定义方法发送本地图片或BytesIO
-            result = loop.run_until_complete(self._send_image(receiver, image_input))
+            # 使用我们的自定义方法发送本地图片或BytesIO，传递上下文参数
+            result = loop.run_until_complete(self._send_image(receiver, image_input, context))
             
             if result and isinstance(result, dict) and result.get("Success", False):
                 logger.info(f"[WX849] 发送图片成功: 接收者: {receiver}")
@@ -3200,6 +3685,9 @@ class WX849Channel(ChatChannel):
             context.type = ctype
             context.content = content
             
+            # 显式设置channel为当前实例，确保回复总是通过当前通道
+            context.channel = self
+            
             # 获取消息对象
             msg = kwargs.get('msg')
             
@@ -3444,3 +3932,390 @@ class WX849Channel(ChatChannel):
                     logger.error("[WX849] 刷新token失败")
         
         return response
+
+    def reply(self, reply: Reply, context: Context = None):
+        """回复消息的统一处理函数"""
+        # 强制确保context中的channel是当前通道
+        if context and hasattr(context, 'channel'):
+            if context.channel.__class__.__name__ != self.__class__.__name__:
+                logger.warning(f"[WX849] 修正通道不匹配问题: {context.channel.__class__.__name__} -> {self.__class__.__name__}")
+                context.channel = self
+
+        if reply.type in self.NOT_SUPPORT_REPLYTYPE:
+            logger.warning(f"[WX849] 暂不支持回复类型: {reply.type}")
+            return
+
+        receiver = context["receiver"] if context and "receiver" in context else ""
+        if not receiver:
+            logger.error("[WX849] 回复失败: 接收者为空")
+            return
+
+        # 创建简单的事件循环，用于执行异步任务
+        loop = asyncio.new_event_loop()
+
+        if reply.type == ReplyType.TEXT:
+            reply.content = remove_markdown_symbol(reply.content)
+            result = loop.run_until_complete(self._send_message(receiver, reply.content))
+            if result and isinstance(result, dict) and result.get("Success", False):
+                logger.info(f"[WX849] 发送文本消息成功: 接收者: {receiver}")
+                if conf().get("log_level", "INFO") == "DEBUG":
+                    logger.debug(f"[WX849] 消息内容: {reply.content[:50]}...")
+            else:
+                logger.warning(f"[WX849] 发送文本消息可能失败: 接收者: {receiver}, 结果: {result}")
+        
+        elif reply.type == ReplyType.ERROR or reply.type == ReplyType.INFO:
+            reply.content = remove_markdown_symbol(reply.content)
+            result = loop.run_until_complete(self._send_message(receiver, reply.content))
+            if result and isinstance(result, dict) and result.get("Success", False):
+                logger.info(f"[WX849] 发送消息成功: 接收者: {receiver}")
+                if conf().get("log_level", "INFO") == "DEBUG":
+                    logger.debug(f"[WX849] 消息内容: {reply.content[:50]}...")
+            else:
+                logger.warning(f"[WX849] 发送消息可能失败: 接收者: {receiver}, 结果: {result}")
+        
+        elif reply.type == ReplyType.IMAGE_URL:
+            # 从网络下载图片并发送
+            img_url = reply.content
+            logger.debug(f"[WX849] 开始下载图片, url={img_url}")
+            try:
+                pic_res = requests.get(img_url, stream=True)
+                # 使用临时文件保存图片
+                tmp_path = os.path.join(get_appdata_dir(), f"tmp_img_{int(time.time())}.png")
+                with open(tmp_path, 'wb') as f:
+                    for block in pic_res.iter_content(1024):
+                        f.write(block)
+                
+                # 检查文件类型，特殊处理WebP
+                img_type = imghdr.what(tmp_path)
+                if img_type == 'webp':
+                    logger.debug(f"[WX849] 检测到WebP格式图片，尝试转换为PNG")
+                    try:
+                        with open(tmp_path, 'rb') as f:
+                            webp_data = f.read()
+                        
+                        # 转换WebP为PNG
+                        png_data = self._convert_webp_to_png(webp_data)
+                        
+                        # 保存PNG图片
+                        png_path = os.path.join(get_appdata_dir(), f"tmp_img_{int(time.time())}.png")
+                        with open(png_path, 'wb') as f:
+                            f.write(png_data.getvalue())
+                        
+                        # 删除原始WebP文件
+                        try:
+                            os.remove(tmp_path)
+                        except Exception as e:
+                            logger.debug(f"[WX849] 删除临时WebP文件失败: {e}")
+                        
+                        # 使用转换后的PNG文件
+                        tmp_path = png_path
+                        logger.debug(f"[WX849] WebP已转换为PNG: {tmp_path}")
+                    except Exception as e:
+                        logger.error(f"[WX849] WebP转换失败: {e}，将使用原始文件")
+                
+                # 使用我们的自定义方法发送图片，传递上下文参数
+                result = loop.run_until_complete(self._send_image(receiver, tmp_path, context))
+                
+                if result and isinstance(result, dict) and result.get("Success", False):
+                    logger.info(f"[WX849] 发送图片成功: 接收者: {receiver}")
+                else:
+                    logger.warning(f"[WX849] 发送图片可能失败: 接收者: {receiver}, 结果: {result}")
+                
+                # 删除临时文件
+                try:
+                    os.remove(tmp_path)
+                except Exception as e:
+                    logger.debug(f"[WX849] 删除临时图片文件失败: {e}")
+            except Exception as e:
+                logger.error(f"[WX849] 发送图片失败: {e}")
+                logger.error(traceback.format_exc())
+        
+        elif reply.type == ReplyType.IMAGE: # 添加处理 ReplyType.IMAGE
+            image_input = reply.content
+            # 移除 os.path.exists 检查，交由 _send_image 处理
+            # 使用我们的自定义方法发送本地图片或BytesIO，传递上下文参数
+            result = loop.run_until_complete(self._send_image(receiver, image_input, context))
+            
+            if result and isinstance(result, dict) and result.get("Success", False):
+                logger.info(f"[WX849] 发送图片成功: 接收者: {receiver}")
+            else:
+                logger.warning(f"[WX849] 发送图片可能失败: 接收者: {receiver}, 结果: {result}")
+        
+        elif reply.type == ReplyType.VIDEO:
+            video_content = reply.content
+            tmp_video_path = None
+            tmp_thumb_path = None
+            
+            try:
+                if isinstance(video_content, dict):
+                    # 处理预先准备好的视频详情字典
+                    logger.debug("[WX849] 发送预处理的视频数据")
+                    result = loop.run_until_complete(self._send_video(receiver, video_content))
+                
+                elif isinstance(video_content, str) and cv2 is not None: # 处理视频URL
+                    video_url = video_content
+                    logger.info(f"[WX849] 收到视频URL，开始处理: {video_url}")
+                    
+                    # 确保 tmp 目录存在
+                    tmp_dir = get_appdata_dir()
+                    if not os.path.exists(tmp_dir):
+                        os.makedirs(tmp_dir)
+                    
+                    # 1. 下载视频
+                    ts = int(time.time())
+                    tmp_video_path = os.path.join(tmp_dir, f"tmp_video_{ts}.mp4")
+                    logger.debug(f"[WX849] 下载视频到: {tmp_video_path}")
+                    
+                    try:
+                        res = requests.get(video_url, stream=True, timeout=60) # 增加超时
+                        res.raise_for_status() # 检查HTTP错误
+                        with open(tmp_video_path, 'wb') as f:
+                            for chunk in res.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                        logger.debug(f"[WX849] 视频下载完成")
+                    except requests.exceptions.RequestException as e:
+                        logger.error(f"[WX849] 下载视频失败: {e}")
+                        return
+                    except Exception as e:
+                        logger.error(f"[WX849] 保存视频文件失败: {e}")
+                        return
+
+                    # 2. 使用 OpenCV 获取时长和缩略图
+                    logger.debug(f"[WX849] 使用OpenCV处理视频: {tmp_video_path}")
+                    cap = cv2.VideoCapture(tmp_video_path)
+                    if not cap.isOpened():
+                        logger.error(f"[WX849] 无法打开视频文件: {tmp_video_path}")
+                        return
+
+                    # 获取时长
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    duration = math.ceil(frame_count / fps) if fps > 0 else 0
+                    logger.debug(f"[WX849] 视频信息 - FPS: {fps}, 帧数: {frame_count}, 时长: {duration}s")
+                    
+                    # 获取缩略图 (第一帧)
+                    success, frame = cap.read()
+                    cap.release() # 及时释放资源
+                    
+                    if not success:
+                        logger.error(f"[WX849] 无法读取视频帧用于缩略图")
+                        return
+                        
+                    tmp_thumb_path = os.path.join(tmp_dir, f"tmp_thumb_{ts}.jpg")
+                    logger.debug(f"[WX849] 保存缩略图到: {tmp_thumb_path}")
+                    if not cv2.imwrite(tmp_thumb_path, frame):
+                       logger.error(f"[WX849] 保存缩略图失败: {tmp_thumb_path}")
+                       return
+
+                    # 3. 构建 video_details 并发送
+                    video_details = {
+                        "video": tmp_video_path,
+                        "thumbnail": tmp_thumb_path,
+                        "duration": duration
+                    }
+                    logger.debug(f"[WX849] 准备发送处理后的视频")
+                    result = loop.run_until_complete(self._send_video(receiver, video_details))
+                    
+                elif isinstance(video_content, str) and cv2 is None:
+                    logger.error("[WX849] 收到视频URL，但未安装opencv-python，无法处理")
+                    result = None # 标记为失败
+                
+                else:
+                    logger.error(f"[WX849] 发送视频失败: 不支持的 reply.content 类型: {type(video_content)}")
+                    result = None # 标记为失败
+                    
+                # 日志记录发送结果
+                if result and isinstance(result, dict) and result.get("Success", False):
+                    logger.info(f"[WX849] 发送视频成功: 接收者: {receiver}")
+                else:
+                    # 增加详细的失败原因日志
+                    reason = "处理失败或API返回错误"
+                    if isinstance(video_content, str) and cv2 is None:
+                        reason = "未安装opencv-python"
+                    elif not isinstance(video_content, (dict, str)):
+                        reason = f"不支持的内容类型 {type(video_content)}"
+                    logger.warning(f"[WX849] 发送视频可能失败: 接收者: {receiver}, 原因: {reason}, API结果: {result}")
+
+            except Exception as e:
+                logger.error(f"[WX849] 处理并发送视频时发生意外错误: {e}")
+                import traceback
+                logger.error(f"[WX849] 详细错误: {traceback.format_exc()}")
+            finally:
+                # 清理临时文件
+                if tmp_video_path and os.path.exists(tmp_video_path):
+                    try:
+                        os.remove(tmp_video_path)
+                        logger.debug(f"[WX849] 已删除临时视频文件: {tmp_video_path}")
+                    except Exception as e:
+                        logger.error(f"[WX849] 删除临时视频文件失败: {e}")
+                if tmp_thumb_path and os.path.exists(tmp_thumb_path):
+                    try:
+                        os.remove(tmp_thumb_path)
+                        logger.debug(f"[WX849] 已删除临时缩略图文件: {tmp_thumb_path}")
+                    except Exception as e:
+                        logger.error(f"[WX849] 删除临时缩略图文件失败: {e}")
+        
+        # 移除不存在的ReplyType.Emoji类型处理
+        # elif reply.type == ReplyType.Emoji:
+        #     emoji_input = reply.content
+        #     # 移除 os.path.exists 检查，交由 _send_emoji 处理
+        #     # 使用我们的自定义方法发送表情
+        #     result = loop.run_until_complete(self._send_emoji(receiver, emoji_input))
+        #     
+        #     if result and isinstance(result, dict) and result.get("Success", False):
+        #         logger.info(f"[WX849] 发送表情成功: 接收者: {receiver}")
+        #     else:
+        #         logger.warning(f"[WX849] 发送表情可能失败: 接收者: {receiver}, 结果: {result}")
+        
+        # 移除不存在的ReplyType.App类型，改用ReplyType.MINIAPP
+        elif reply.type == ReplyType.MINIAPP:
+            app_input = reply.content
+            # 移除 os.path.exists 检查，交由 _send_app 处理
+            # 使用我们的自定义方法发送小程序
+            result = loop.run_until_complete(self._send_app(receiver, app_input))
+            
+            if result and isinstance(result, dict) and result.get("Success", False):
+                logger.info(f"[WX849] 发送小程序成功: 接收者: {receiver}")
+            else:
+                logger.warning(f"[WX849] 发送小程序可能失败: 接收者: {receiver}, 结果: {result}")
+        
+        # 移除不存在的ReplyType.System类型，使用ReplyType.INFO或忽略
+        elif reply.type == ReplyType.INFO:
+            system_input = reply.content
+            # 移除 os.path.exists 检查，交由 _send_system 处理
+            # 使用我们的自定义方法发送系统消息
+            result = loop.run_until_complete(self._send_message(receiver, system_input))
+            
+            if result and isinstance(result, dict) and result.get("Success", False):
+                logger.info(f"[WX849] 发送系统消息成功: 接收者: {receiver}")
+            else:
+                logger.warning(f"[WX849] 发送系统消息可能失败: 接收者: {receiver}, 结果: {result}")
+        
+        elif reply.type == ReplyType.VIDEO_URL:
+            # 从网络下载视频URL并发送
+            video_url = reply.content
+            logger.info(f"[WX849] 开始处理视频URL: {video_url}")
+            tmp_video_path = None
+            tmp_thumb_path = None
+            
+            try:
+                # 确保opencv-python已安装
+                if cv2 is None:
+                    logger.error("[WX849] 无法处理视频URL: 未安装opencv-python库")
+                    # 发送错误消息给用户，通知安装依赖
+                    error_msg = "抱歉，服务器未安装视频处理库(OpenCV)，无法发送视频。请联系管理员安装 opencv-python 包。"
+                    loop.run_until_complete(self._send_message(receiver, error_msg))
+                    return
+                
+                # 确保tmp目录存在
+                tmp_dir = get_appdata_dir()
+                if not os.path.exists(tmp_dir):
+                    os.makedirs(tmp_dir)
+                
+                # 1. 下载视频
+                ts = int(time.time())
+                tmp_video_path = os.path.join(tmp_dir, f"tmp_video_{ts}.mp4")
+                logger.debug(f"[WX849] 下载视频到: {tmp_video_path}")
+                
+                try:
+                    res = requests.get(video_url, stream=True, timeout=60)
+                    res.raise_for_status()
+                    with open(tmp_video_path, 'wb') as f:
+                        for chunk in res.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    logger.debug(f"[WX849] 视频下载完成")
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"[WX849] 下载视频失败: {e}")
+                    error_msg = f"视频下载失败: {str(e)}"
+                    loop.run_until_complete(self._send_message(receiver, error_msg))
+                    return
+                
+                # 2. 使用OpenCV获取时长和缩略图
+                logger.debug(f"[WX849] 处理视频获取缩略图: {tmp_video_path}")
+                cap = cv2.VideoCapture(tmp_video_path)
+                if not cap.isOpened():
+                    logger.error(f"[WX849] 无法打开视频文件: {tmp_video_path}")
+                    error_msg = "视频处理失败: 无法打开视频文件"
+                    loop.run_until_complete(self._send_message(receiver, error_msg))
+                    return
+                
+                # 获取视频时长
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                duration = math.ceil(frame_count / fps) if fps > 0 else 10
+                logger.debug(f"[WX849] 视频信息 - FPS: {fps}, 帧数: {frame_count}, 时长: {duration}秒")
+                
+                # 获取缩略图 (第一帧)
+                success, frame = cap.read()
+                cap.release()
+                
+                if not success:
+                    logger.error(f"[WX849] 无法读取视频帧用于缩略图")
+                    # 使用默认缩略图
+                    import base64
+                    thumbnail_base64 = "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+                    logger.debug("[WX849] 使用默认缩略图")
+                else:
+                    # 保存缩略图 - 保持原始尺寸
+                    tmp_thumb_path = os.path.join(tmp_dir, f"tmp_thumb_{ts}.jpg")
+                    # 不调整尺寸，直接保存原始帧
+                    if not cv2.imwrite(tmp_thumb_path, frame):
+                        logger.error(f"[WX849] 保存缩略图失败")
+                        # 使用默认缩略图
+                        import base64
+                        thumbnail_base64 = "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+                        logger.debug("[WX849] 使用默认缩略图")
+                    else:
+                        # 记录缩略图尺寸信息
+                        height, width, _ = frame.shape
+                        logger.debug(f"[WX849] 缩略图尺寸: {width}x{height}")
+                        thumbnail_base64 = None  # 使用文件路径
+                
+                # 3. 构建视频详情并发送
+                video_details = {
+                    "video": tmp_video_path,
+                    "thumbnail": tmp_thumb_path if tmp_thumb_path and os.path.exists(tmp_thumb_path) else thumbnail_base64,
+                    "duration": duration
+                }
+                logger.debug(f"[WX849] 准备发送视频: {video_details}")
+                result = loop.run_until_complete(self._send_video(receiver, video_details))
+                
+                if result and isinstance(result, dict) and result.get("Success", False):
+                    logger.info(f"[WX849] 视频发送成功: 接收者: {receiver}")
+                else:
+                    logger.warning(f"[WX849] 视频发送可能失败: 接收者: {receiver}, 结果: {result}")
+                    # 尝试发送链接作为备用方案
+                    fallback_msg = f"视频发送失败，您可以通过以下链接查看视频: {video_url}"
+                    loop.run_until_complete(self._send_message(receiver, fallback_msg))
+            except Exception as e:
+                logger.error(f"[WX849] 处理视频URL失败: {e}")
+                import traceback
+                logger.error(f"[WX849] 详细错误: {traceback.format_exc()}")
+                # 发送错误消息
+                error_msg = f"视频处理失败: {str(e)}"
+                try:
+                    loop.run_until_complete(self._send_message(receiver, error_msg))
+                    # 尝试发送链接作为备用方案
+                    fallback_msg = f"您可以通过以下链接查看视频: {video_url}"
+                    loop.run_until_complete(self._send_message(receiver, fallback_msg))
+                except:
+                    pass
+            finally:
+                # 清理临时文件
+                if tmp_video_path and os.path.exists(tmp_video_path):
+                    try:
+                        os.remove(tmp_video_path)
+                        logger.debug(f"[WX849] 已删除临时视频文件: {tmp_video_path}")
+                    except Exception as e:
+                        logger.error(f"[WX849] 删除临时视频文件失败: {e}")
+                if tmp_thumb_path and os.path.exists(tmp_thumb_path):
+                    try:
+                        os.remove(tmp_thumb_path)
+                        logger.debug(f"[WX849] 已删除临时缩略图文件: {tmp_thumb_path}")
+                    except Exception as e:
+                        logger.error(f"[WX849] 删除临时缩略图文件失败: {e}")
+        
+        else:
+            logger.warning(f"[WX849] 不支持的回复类型: {reply.type}")
+        
+        loop.close() 

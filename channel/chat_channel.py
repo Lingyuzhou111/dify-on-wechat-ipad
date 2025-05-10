@@ -297,7 +297,15 @@ class ChatChannel(Channel):
 
     def _send(self, reply: Reply, context: Context, retry_cnt=0):
         try:
-            self.send(reply, context)
+            # 检查context是否包含原始通道，如果包含就用原始通道发送回复
+            if hasattr(context, 'channel') and context.channel:
+                # 使用接收消息时的原始通道发送回复
+                logger.debug(f"[chat_channel] 使用原始通道 {context.channel.__class__.__name__} 发送回复")
+                context.channel.send(reply, context)
+            else:
+                # 如果没有原始通道，才使用当前通道
+                logger.debug(f"[chat_channel] 无原始通道，使用当前通道 {self.__class__.__name__} 发送回复")
+                self.send(reply, context)
         except Exception as e:
             logger.error("[chat_channel] sendMsg error: {}".format(str(e)))
             if isinstance(e, NotImplementedError):

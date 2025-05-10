@@ -46,10 +46,10 @@ pip install -r requirements-optional.txt
     "dify_api_key": "你的Dify_API_Key",       
     "channel_type": "wx849",             
     "wx849_api_host": "127.0.0.1",  # 微信849协议API地址
-    "wx849_api_port": 9000,  # 微信849协议API端口
+    "wx849_api_port": 9011,  # 微信849协议API端口
     "wx849_protocol_version": "849",  # 微信849协议版本，暂不可选: "855", "ipad"
     "log_level": "INFO",                        
-    "model": "dify",                     
+    "model": "chatflow",  # 支持chatbot，agent，workflow，chatflow                 
     "single_chat_prefix": [""],          
     "group_chat_prefix": ["@bot"],       
     "group_name_white_list": ["ALL_GROUP"] 

@@ -44,6 +44,9 @@ class WX849Message(ChatMessage):
         self.actual_user_id = ""    # 实际发送者ID
         self.actual_user_nickname = "" # 实际发送者昵称
         
+        self._convert_msg_type_to_ctype()
+        self.type = self.ctype  # Ensure self.type attribute exists and holds the ContextType value
+        
         # 尝试从MsgSource中提取机器人在群内的昵称
         try:
             msg_source = msg.get("MsgSource", "")
@@ -58,6 +61,64 @@ class WX849Message(ChatMessage):
                         break
         except Exception as e:
             # 解析失败，保持为空字符串
+            pass
+    
+    def _convert_msg_type_to_ctype(self):
+        """
+        Converts the raw message type (self.msg_type) to ContextType (self.ctype).
+        WX849/iPad协议原始消息类型:
+        1: 文本
+        3: 图片
+        34: 语音
+        37: 好友确认 (添加好友请求)
+        40: POSSIBLE_FRIEND_MSG (新的好友推荐)
+        42: 名片
+        43: 视频
+        47: 表情/贴纸
+        48: 位置
+        49: App消息 (分享链接, 文件, 转账, 红包, 小程序等)
+        51: 微信状态同步/操作通知
+        62: 小视频
+        10000: 系统消息
+        10002: 撤回消息的系统提示
+        """
+        raw_type = str(self.msg_type) # Ensure it's a string
+
+        if raw_type == "1":
+            self.ctype = ContextType.TEXT
+        elif raw_type == "3":
+            self.ctype = ContextType.IMAGE
+        elif raw_type == "34":
+            self.ctype = ContextType.VOICE
+        elif raw_type == "43" or raw_type == "62": # Video and Short Video
+            self.ctype = ContextType.VIDEO
+        elif raw_type == "47": # Sticker/Emoji
+            self.ctype = ContextType.EMOJI 
+        elif raw_type == "49": # App Message (XML based)
+            self.ctype = ContextType.XML
+        elif raw_type == "42": # Contact Card
+            self.ctype = ContextType.XML # Or a specific ContextType.CONTACT_CARD
+        elif raw_type == "48": # Location
+            self.ctype = ContextType.XML # Or a specific ContextType.LOCATION
+        elif raw_type == "37" or raw_type == "40": # Friend request, recommendation
+            self.ctype = ContextType.SYSTEM # Or ContextType.INFO
+        elif raw_type == "51": # Status/Operation (e.g. friend verified, typing)
+            # Assuming ContextType.STATUS_SYNC exists or is mapped to SYSTEM/INFO
+            if hasattr(ContextType, 'STATUS_SYNC'):
+                self.ctype = ContextType.STATUS_SYNC
+            else:
+                self.ctype = ContextType.SYSTEM # Fallback if STATUS_SYNC not defined
+        elif raw_type == "10000": # System message
+            self.ctype = ContextType.INFO # Or ContextType.SYSTEM
+        elif raw_type == "10002": # System message for recalled message
+            # Assuming ContextType.RECALLED exists or is mapped to SYSTEM/INFO
+            if hasattr(ContextType, 'RECALLED'):
+                self.ctype = ContextType.RECALLED
+            else:
+                self.ctype = ContextType.SYSTEM # Fallback if RECALLED not defined
+        else:
+            # self.ctype remains ContextType.UNKNOWN (as initialized)
+            # Consider logging: logger.debug(f"[WX849Message] Unmapped raw msg_type: {self.msg_type}, ctype remains UNKNOWN.")
             pass
     
     def _get_string_value(self, value):

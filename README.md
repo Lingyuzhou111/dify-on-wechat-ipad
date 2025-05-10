@@ -38,7 +38,7 @@ pip install -r requirements-optional.txt
 
 ### 3. 配置文件
 
-复制`config-template.json`为`config.json`，并修改关键配置：
+复制`config-template.json`为`config.json`，并修改关键配置（在原版基础上增加调用dify以外的LLM选项）：
 
 ```json
 {
@@ -47,7 +47,7 @@ pip install -r requirements-optional.txt
   "dify_app_type": "chatflow",      # 支持chatbot，agent，workflow，chatflow
   "channel_type": "wx849",
   "wx849_api_host": "127.0.0.1",    # 微信849协议API地址
-  "wx849_api_port": 9011,  # 微信849协议API端口
+  "wx849_api_port": 9011,           # 微信849协议API端口
   "wx849_protocol_version": "849",  # 微信849协议版本，暂不可选: "855", "ipad"
   "log_level": "INFO",
   "group_chat_prefix": ["xy","晓颜","@晓颜"],  # 改成你自己的bot昵称

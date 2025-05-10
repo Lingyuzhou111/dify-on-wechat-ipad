@@ -22,7 +22,7 @@
 ### 1. 下载源码
 
 ```bash
-git clone [https://github.com/AnCool-OvO/dify-on-wechat-ipad](https://github.com/Lingyuzhou111/dify-on-wechat-ipad).git
+git clone https://github.com/Lingyuzhou111/dify-on-wechat-ipad.git
 cd dify-on-wechat-ipad
 ```
 

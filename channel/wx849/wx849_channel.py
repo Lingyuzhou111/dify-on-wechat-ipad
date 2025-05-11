@@ -722,14 +722,7 @@ class WX849Channel(ChatChannel):
         
         logger.info(f"[WX849] 开始自动登录流程: wxid={saved_wxid}")
         
-        # 移除一开始的一致性检查，这会导致服务器未登录时直接失败
-        # is_consistent = await self._check_api_login_consistency(saved_wxid)
-        # if not is_consistent:
-        #     logger.warning(f"[WX849] API服务器登录用户与本地保存不一致，重新登录")
-        #     return False
-        
         # 直接进行心跳检测等自动登录步骤
-        
         # 1. 首先检查登录状态 - 通过心跳接口
         logger.info(f"[WX849] 第1步: 检查心跳状态")
         heart_beat_ok = await self._check_login_status(saved_wxid)
@@ -1026,7 +1019,7 @@ class WX849Channel(ChatChannel):
 
     # MODIFIED: New filter method with corrected sender ID logic for gh_ check
     def _should_filter_this_message(self, wx_msg: 'WX849Message') -> bool:
-        # Ensure necessary imports are at the top of the file:
+        # 过滤非用户消息
         # import time
         # from bridge.context import ContextType
         # from config import conf
@@ -1058,9 +1051,6 @@ class WX849Channel(ChatChannel):
         if isinstance(actual_from_user_id, str) and actual_from_user_id.startswith("gh_"):
             logger.debug(f"[WX849] Filter: Ignored official account message from {actual_from_user_id}: {_message_content_preview}")
             return True
-
-        # For subsequent filters, use effective_sender_id for logging and identity checks.
-        # This 'effective_sender_id' will be the actual user in a group, or the from_user_id in other cases.
 
         # 2. Ignore voice messages if speech recognition is off
         if _message_type == ContextType.VOICE:
@@ -3262,6 +3252,54 @@ class WX849Channel(ChatChannel):
         
         logger.info(f"收到系统消息: ID:{cmsg.msg_id} 来自:{cmsg.from_user_id} 发送人:{cmsg.sender_wxid} 内容:{cmsg.content}")
 
+    def _is_likely_base64_for_log(self, s: str) -> bool:
+        """
+        判断字符串是否可能是base64编码 (用于日志记录目的)。
+        直接改编自 gemini_image.py 中的 _is_likely_base64。
+        """
+        if not isinstance(s, str): # 确保是字符串
+            return False
+        # base64编码通常只包含A-Z, a-z, 0-9, +, /, =
+        if not s or len(s) < 50:  # 太短的字符串不太可能是需要截断的base64
+            return False
+            
+        # 检查字符是否符合base64编码
+        base64_chars_set = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+        non_base64_count = 0
+        for char_value in s: # s 是字符串，char_value 是字符
+            if char_value not in base64_chars_set and char_value != '=': # '=' 是填充字符
+                non_base64_count += 1
+        
+        if non_base64_count < len(s) * 0.05 and len(s) > 100:
+            return True
+        return False
+
+    def _create_loggable_params(self, data: any) -> any:
+        """
+        创建参数的安全版本，用于日志记录。
+        将可能的base64数据替换为长度和预览指示器。
+        此函数通过构建新的字典/列表来确保原始数据不被修改。
+        """
+        if isinstance(data, dict):
+            new_dict = {}
+            for key, value in data.items():
+                new_dict[key] = self._create_loggable_params(value) # 递归调用
+            return new_dict
+        elif isinstance(data, list):
+            new_list = []
+            for item in data:
+                new_list.append(self._create_loggable_params(item)) # 递归调用
+            return new_list
+        elif isinstance(data, str):
+            if self._is_likely_base64_for_log(data):
+                # 截断并添加长度指示器，类似 gemini_image.py 的做法
+                return f"{data[:20]}... [base64_len:{len(data)} chars]"
+            else:
+                return data # 如果不是base64或太短，返回原字符串
+        else:
+            # 对于其他数据类型 (如 int, float, bool, None 等) 返回原样
+            return data
+
     async def _call_api(self, endpoint, params, retry_count=0, max_retries=2):
         """调用API接口
         
@@ -3301,7 +3339,9 @@ class WX849Channel(ChatChannel):
             
             # 记录详细的API调用信息
             logger.debug(f"[WX849] API调用: {url}")
-            logger.debug(f"[WX849] 请求参数: {json.dumps(params, ensure_ascii=False)}")
+
+            loggable_params = self._create_loggable_params(params)
+            logger.debug(f"[WX849] 请求参数: {json.dumps(loggable_params, ensure_ascii=False)}")
             
             # 判断是否是需要使用表单数据的请求
             need_form_data = False
@@ -4999,30 +5039,6 @@ class WX849Channel(ChatChannel):
                 # 设置session_id为群ID
                 context["session_id"] = msg.other_user_id or msg.from_user_id
                 
-                # # 启动异步任务获取群名称并更新
-                # loop = asyncio.get_event_loop() 
-                # try:
-                #     # 尝试创建异步任务获取群名
-                #     async def update_group_name():
-                #         try:
-                #             group_name = await self._get_group_name(msg.from_user_id)
-                #             if group_name:
-                #                 context['group_name'] = group_name
-                #                 logger.debug(f"[WX849] 更新群名称: {group_name}")
-                #         except Exception as e:
-                #             logger.error(f"[WX849] 更新群名称失败: {e}")
-                #     
-                #     # 使用已有事件循环运行更新任务
-                #     def run_async_task():
-                #         try:
-                #             asyncio.run(update_group_name())
-                #         except Exception as e:
-                #             logger.error(f"[WX849] 异步获取群名称任务失败: {e}")
-                #     
-                #     # 启动线程执行异步任务
-                #     threading.Thread(target=run_async_task).start()
-                # except Exception as e:
-                #     logger.error(f"[WX849] 创建获取群名称任务失败: {e}")
             else:
                 # 私聊消息
                 context["isgroup"] = False

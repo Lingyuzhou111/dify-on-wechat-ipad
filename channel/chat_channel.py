@@ -11,6 +11,7 @@ from channel.channel import Channel
 from common.dequeue import Dequeue
 from common import memory
 from plugins import *
+from common.log import logger
 
 try:
     from voice.audio_convert import any_to_wav
@@ -29,9 +30,11 @@ class ChatChannel(Channel):
     lock = threading.Lock()  # 用于控制对sessions的访问
 
     def __init__(self):
+        self._running = True
         _thread = threading.Thread(target=self.consume)
         _thread.setDaemon(True)
         _thread.start()
+        self._thread = _thread
 
     # 根据消息构造context，消息内容相关的触发项写在这里
     def _compose_context(self, ctype: ContextType, content, **kwargs):
@@ -230,6 +233,22 @@ class ChatChannel(Channel):
                 }
             elif context.type == ContextType.ACCEPT_FRIEND:  # 好友申请，匹配字符串
                 reply = self._build_friend_request_reply(context)
+            elif context.type == ContextType.XML:
+                logger.debug(f"[chat_channel] Received XML context. Content snippet: {str(context.content)[:100]}")
+                cmsg = context.kwargs.get('msg')
+                if cmsg and getattr(cmsg, 'is_processed_text_quote', False):
+                    logger.info("[chat_channel] XML context is a processed text quote, converting to TEXT context.")
+                    new_context = self._compose_context(ContextType.TEXT, cmsg.content, **context.kwargs)
+                    if new_context:
+                        if hasattr(context, 'is_break') and context.is_break:
+                            new_context.is_break = True
+                        return self._generate_reply(new_context) 
+                    else:
+                        logger.error("[chat_channel] Failed to convert processed XML quote to TEXT context. Original XML content remains.")
+                        pass 
+                else:
+                    logger.debug("[chat_channel] XML message is not a processed text quote or cmsg not found. Passing.")
+                    pass 
             elif context.type == ContextType.SHARING:  # 分享信息，当前无默认逻辑
                 pass
             elif context.type == ContextType.FUNCTION or context.type == ContextType.FILE:  # 文件消息及函数调用等，当前无默认逻辑
@@ -341,13 +360,23 @@ class ChatChannel(Channel):
                     self._fail_callback(session_id, exception=worker_exception, **kwargs)
                 else:
                     self._success_callback(session_id, **kwargs)
-            except CancelledError as e:
+            except CancelledError as e: # noqa E722
                 logger.info("Worker cancelled, session_id = {}".format(session_id))
             except Exception as e:
                 logger.exception("Worker raise exception: {}".format(e))
+            
+            # Ensure semaphore release is robust and handles cases where session might be gone
             with self.lock:
-                self.sessions[session_id][1].release()
-
+                if session_id in self.sessions and self.sessions[session_id] and len(self.sessions[session_id]) > 1:
+                    try:
+                        self.sessions[session_id][1].release()
+                        logger.debug(f"[chat_channel] Semaphore released in callback for session {session_id}")
+                    except ValueError as ve: 
+                        logger.error(f"[chat_channel] Semaphore for session {session_id} likely released too many times in callback. Error: {ve}")
+                    except Exception as e:
+                        logger.error(f"[chat_channel] Error releasing semaphore in callback for session {session_id}: {e}")
+                else:
+                    logger.warning(f"[chat_channel] Session {session_id} or its semaphore no longer exists in _thread_pool_callback. Cannot release.")
         return func
 
     def produce(self, context: Context):
@@ -365,30 +394,86 @@ class ChatChannel(Channel):
 
     # 消费者函数，单独线程，用于从消息队列中取出消息并处理
     def consume(self):
-        while True:
+        while self._running:
             with self.lock:
+                if not self._running:
+                    break
                 session_ids = list(self.sessions.keys())
             for session_id in session_ids:
+                if not self._running:
+                    break 
                 with self.lock:
+                    if session_id not in self.sessions:
+                        continue
                     context_queue, semaphore = self.sessions[session_id]
-                if semaphore.acquire(blocking=False):  # 等线程处理完毕才能删除
-                    if not context_queue.empty():
-                        context = context_queue.get()
-                        logger.debug("[chat_channel] consume context: {}".format(context))
-                        future: Future = handler_pool.submit(self._handle, context)
-                        future.add_done_callback(self._thread_pool_callback(session_id, context=context))
-                        with self.lock:
-                            if session_id not in self.futures:
-                                self.futures[session_id] = []
-                            self.futures[session_id].append(future)
-                    elif semaphore._initial_value == semaphore._value + 1:  # 除了当前，没有任务再申请到信号量，说明所有任务都处理完毕
-                        with self.lock:
-                            self.futures[session_id] = [t for t in self.futures[session_id] if not t.done()]
-                            assert len(self.futures[session_id]) == 0, "thread pool error"
-                            del self.sessions[session_id]
-                    else:
-                        semaphore.release()
+                
+                acquired_semaphore = False
+                task_submitted_and_callback_attached = False # ADDED: Flag to track task submission
+                try:
+                    if semaphore.acquire(blocking=False):  # 等线程处理完毕才能删除
+                        acquired_semaphore = True
+                        if not context_queue.empty():
+                            if not self._running: # Check again after acquiring semaphore and before getting context
+                                # self._running is false, ensure semaphore is released if we break
+                                break 
+                            context = context_queue.get()
+                            logger.debug("[chat_channel] consume context: {}".format(context))
+                            try:
+                                future: Future = handler_pool.submit(self._handle, context)
+                                future.add_done_callback(self._thread_pool_callback(session_id, context=context))
+                                task_submitted_and_callback_attached = True # MODIFIED: Set flag on successful submission and callback attach
+                                with self.lock:
+                                    if session_id not in self.futures:
+                                        self.futures[session_id] = []
+                                    self.futures[session_id].append(future)
+                            except RuntimeError as e:
+                                if "cannot schedule new futures after interpreter shutdown" in str(e):
+                                    logger.warning(f"[chat_channel] Interpreter shutting down, handler_pool closed. Stopping consume thread for session ID: {session_id}. Error: {e}")
+                                    self._running = False
+                                    # task_submitted_and_callback_attached remains False, so finally block will release
+                                else:
+                                    logger.error(f"[chat_channel] RuntimeError in consume: {e}. Session ID: {session_id}")
+                                # task_submitted_and_callback_attached remains False, so finally block will release
+                            except Exception as e:
+                                logger.error(f"[chat_channel] Exception submitting task to handler_pool: {e}. Session ID: {session_id}")
+                                # task_submitted_and_callback_attached remains False, so finally block will release
+                        
+                        # This elif branch means semaphore was acquired, but no task was submitted because queue was empty
+                        # or other conditions for session deletion were met. 
+                        # So, task_submitted_and_callback_attached will be False, and finally block should release.
+                        elif semaphore._initial_value == semaphore._value + 1: 
+                            if self._running:
+                                with self.lock:
+                                    if session_id in self.futures:
+                                        self.futures[session_id] = [t for t in self.futures[session_id] if not t.done()]
+                                        if not self.futures[session_id]:
+                                            del self.futures[session_id]
+                                    
+                                    if context_queue.empty() and (session_id not in self.futures or not self.futures[session_id]):
+                                        logger.debug(f"[chat_channel] Deleting empty session {session_id}")
+                                        del self.sessions[session_id]
+                                        # If session is deleted, the acquired semaphore is implicitly gone with it.
+                                        # However, to be safe, if acquired_semaphore is true and task not submitted, it should be released.
+                                        # The current logic with task_submitted_and_callback_attached should handle this.
+                        # else: semaphore acquired, but queue was empty and session not deleted. 
+                        # task_submitted_and_callback_attached is False. Finally block should release.
+                finally:
+                    if acquired_semaphore and not task_submitted_and_callback_attached:
+                        try:
+                            semaphore.release()
+                            logger.debug(f"[chat_channel] Semaphore released in consume finally for session {session_id} (task not submitted or submission failed)")
+                        except ValueError as ve:
+                             logger.error(f"[chat_channel] Error releasing semaphore in consume finally for session {session_id}. Error: {ve}")
+                        except Exception as e:
+                            logger.error(f"[chat_channel] Generic error releasing semaphore in consume finally for session {session_id}: {e}")
+
+                if not self._running:
+                    break
+            
+            if not self._running:
+                break
             time.sleep(0.2)
+        logger.info("[chat_channel] Consume thread gracefully finished.")
 
     # 取消session_id对应的所有任务，只能取消排队的消息和已提交线程池但未执行的任务
     def cancel_session(self, session_id):
@@ -404,12 +489,24 @@ class ChatChannel(Channel):
     def cancel_all_session(self):
         with self.lock:
             for session_id in self.sessions:
-                for future in self.futures[session_id]:
-                    future.cancel()
+                if session_id in self.futures:
+                    for future in self.futures[session_id]:
+                        future.cancel()
                 cnt = self.sessions[session_id][0].qsize()
                 if cnt > 0:
                     logger.info("Cancel {} messages in session {}".format(cnt, session_id))
                 self.sessions[session_id][0] = Dequeue()
+
+    def shutdown(self):
+        logger.info("[chat_channel] Shutdown called. Signaling consume thread to stop.")
+        self._running = False
+        if hasattr(self, '_thread') and self._thread.is_alive():
+            logger.debug("[chat_channel] Waiting for consume thread to join...")
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logger.warning("[chat_channel] Consume thread did not stop in 5 seconds.")
+            else:
+                logger.info("[chat_channel] Consume thread joined successfully.")
 
 
 def check_prefix(content, prefix_list):

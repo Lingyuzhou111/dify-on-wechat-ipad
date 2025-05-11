@@ -273,21 +273,33 @@ class ChatChannel(Channel):
                     logger.error("[chat_channel]reply type not support: " + str(reply.type))
                     reply.type = ReplyType.ERROR
                     reply.content = "不支持发送的消息类型: " + str(reply.type)
+                    return reply
 
                 if reply.type == ReplyType.TEXT:
                     reply_text = reply.content
                     if desire_rtype == ReplyType.VOICE and ReplyType.VOICE not in self.NOT_SUPPORT_REPLYTYPE:
                         reply = super().build_text_to_voice(reply.content)
                         return self._decorate_reply(context, reply)
-                    if context.get("isgroup", False):
-                        if not conf().get("no_need_at", False):
-                            reply_text = "@" + context["msg"].actual_user_nickname + "\n" + reply_text.strip()
-                        reply_text = conf().get("group_chat_reply_prefix", "") + reply_text + conf().get(
-                            "group_chat_reply_suffix", "")
+
+                    raw_parts = reply_text.split("//n")
+                    segments_to_process = [p.strip() for p in raw_parts if p.strip()]
+
+                    if not segments_to_process:
+                        reply.content = ""
                     else:
-                        reply_text = conf().get("single_chat_reply_prefix", "") + reply_text + conf().get(
-                            "single_chat_reply_suffix", "")
-                    reply.content = reply_text
+                        decorated_segments = []
+                        for i, segment_content in enumerate(segments_to_process):
+                            current_segment_for_decoration = segment_content
+
+                            if context.get("isgroup", False):
+                                decorated_segment_payload = conf().get("group_chat_reply_prefix", "") + current_segment_for_decoration + conf().get("group_chat_reply_suffix", "")
+                                if i == 0 and not conf().get("no_need_at", False):
+                                    decorated_segment_payload = "@" + context["msg"].actual_user_nickname + "\n" + decorated_segment_payload
+                            else:
+                                decorated_segment_payload = conf().get("single_chat_reply_prefix", "") + current_segment_for_decoration + conf().get("single_chat_reply_suffix", "")
+                            decorated_segments.append(decorated_segment_payload)
+                        reply.content = "//n".join(decorated_segments)
+
                 elif reply.type == ReplyType.ERROR or reply.type == ReplyType.INFO:
                     reply.content = "[" + str(reply.type) + "]\n" + reply.content
                 elif reply.type == ReplyType.IMAGE_URL or reply.type == ReplyType.VOICE or reply.type == ReplyType.IMAGE or reply.type == ReplyType.FILE or reply.type == ReplyType.VIDEO or reply.type == ReplyType.VIDEO_URL or reply.type == ReplyType.APP:
@@ -296,7 +308,8 @@ class ChatChannel(Channel):
                     pass
                 else:
                     logger.error("[chat_channel] unknown reply type: {}".format(reply.type))
-                    return
+                    return reply
+            
             if desire_rtype and desire_rtype != reply.type and reply.type not in [ReplyType.ERROR, ReplyType.INFO]:
                 logger.warning("[chat_channel] desire_rtype: {}, but reply type: {}".format(context.get("desire_rtype"), reply.type))
             return reply
@@ -311,8 +324,26 @@ class ChatChannel(Channel):
             )
             reply = e_context["reply"]
             if not e_context.is_pass() and reply and reply.type:
+                if not reply.content and reply.type == ReplyType.TEXT: 
+                    logger.debug("[chat_channel] Text reply content is empty after decoration, skipping send.")
+                    return
+
                 logger.debug("[chat_channel] ready to send reply: {}, context: {}".format(reply, context))
-                self._send(reply, context)
+                if reply.type == ReplyType.TEXT and "//n" in reply.content:
+                    all_segments = reply.content.split("//n")
+                    segments_to_send = [s for s in all_segments if s.strip()]
+
+                    if not segments_to_send:
+                        logger.debug("[chat_channel] All segments are empty after splitting by //n, skipping send.")
+                        return
+
+                    for i, segment_text in enumerate(segments_to_send):
+                        segment_reply = Reply(ReplyType.TEXT, segment_text)
+                        self._send(segment_reply, context)
+                        if i < len(segments_to_send) - 1:
+                            time.sleep(0.3)
+                else:
+                    self._send(reply, context)
 
     def _send(self, reply: Reply, context: Context, retry_cnt=0):
         try:
@@ -419,20 +450,19 @@ class ChatChannel(Channel):
                     continue
 
                 acquired_semaphore = False
-                task_submitted_and_callback_attached = False # ADDED: Flag to track task submission
+                task_submitted_and_callback_attached = False
                 try:
-                    if semaphore.acquire(blocking=False):  # 等线程处理完毕才能删除
+                    if semaphore.acquire(blocking=False):
                         acquired_semaphore = True
                         if not context_queue.empty():
-                            if not self._running: # Check again after acquiring semaphore and before getting context
-                                # self._running is false, ensure semaphore is released if we break
+                            if not self._running:
                                 break 
                             context = context_queue.get()
                             logger.debug("[chat_channel] consume context: {}".format(context))
                             try:
                                 future: Future = handler_pool.submit(self._handle, context)
                                 future.add_done_callback(self._thread_pool_callback(session_id, context=context))
-                                task_submitted_and_callback_attached = True # MODIFIED: Set flag on successful submission and callback attach
+                                task_submitted_and_callback_attached = True
                                 with self.lock:
                                     if session_id not in self.futures:
                                         self.futures[session_id] = []
@@ -441,17 +471,11 @@ class ChatChannel(Channel):
                                 if "cannot schedule new futures after interpreter shutdown" in str(e):
                                     logger.warning(f"[chat_channel] Interpreter shutting down, handler_pool closed. Stopping consume thread for session ID: {session_id}. Error: {e}")
                                     self._running = False
-                                    # task_submitted_and_callback_attached remains False, so finally block will release
                                 else:
                                     logger.error(f"[chat_channel] RuntimeError in consume: {e}. Session ID: {session_id}")
-                                # task_submitted_and_callback_attached remains False, so finally block will release
                             except Exception as e:
                                 logger.error(f"[chat_channel] Exception submitting task to handler_pool: {e}. Session ID: {session_id}")
-                                # task_submitted_and_callback_attached remains False, so finally block will release
                         
-                        # This elif branch means semaphore was acquired, but no task was submitted because queue was empty
-                        # or other conditions for session deletion were met. 
-                        # So, task_submitted_and_callback_attached will be False, and finally block should release.
                         elif semaphore._initial_value == semaphore._value + 1: 
                             if self._running:
                                 with self.lock:
@@ -465,9 +489,6 @@ class ChatChannel(Channel):
                                         del self.sessions[session_id]
                                         if session_id in self.futures and not self.futures[session_id]:
                                             del self.futures[session_id]
-                                        # If session is deleted, the acquired semaphore is implicitly gone with it.
-                                        # However, to be safe, if acquired_semaphore is true and task not submitted, it should be released.
-                                        # The current logic with task_submitted_and_callback_attached should handle this.
                         # else: semaphore acquired, but queue was empty and session not deleted. 
                         # task_submitted_and_callback_attached is False. Finally block should release.
                 finally:

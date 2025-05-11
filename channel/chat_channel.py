@@ -407,6 +407,17 @@ class ChatChannel(Channel):
                         continue
                     context_queue, semaphore = self.sessions[session_id]
                 
+                if context_queue.empty():
+                    if self._running:
+                        with self.lock:
+                            if session_id in self.sessions and \
+                               (session_id not in self.futures or not self.futures.get(session_id)):
+                                logger.debug(f"[chat_channel] Deleting empty session {session_id} (pre-semaphore acquire check due to empty queue)")
+                                del self.sessions[session_id]
+                                if session_id in self.futures and not self.futures[session_id]:
+                                    del self.futures[session_id]
+                    continue
+
                 acquired_semaphore = False
                 task_submitted_and_callback_attached = False # ADDED: Flag to track task submission
                 try:
@@ -452,6 +463,8 @@ class ChatChannel(Channel):
                                     if context_queue.empty() and (session_id not in self.futures or not self.futures[session_id]):
                                         logger.debug(f"[chat_channel] Deleting empty session {session_id}")
                                         del self.sessions[session_id]
+                                        if session_id in self.futures and not self.futures[session_id]:
+                                            del self.futures[session_id]
                                         # If session is deleted, the acquired semaphore is implicitly gone with it.
                                         # However, to be safe, if acquired_semaphore is true and task not submitted, it should be released.
                                         # The current logic with task_submitted_and_callback_attached should handle this.

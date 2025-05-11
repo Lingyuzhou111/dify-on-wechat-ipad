@@ -34,7 +34,6 @@ class SiliconFlowBot(Bot):
         if not model or model not in [
             const.DEEPSEEK_V3,
             const.DEEPSEEK_R1,
-            const.QWQ_32B,
             const.GLM_4_9B,
             const.GLM_Z1_9B,
             const.GLM_Z1_R_32B,
@@ -107,7 +106,6 @@ class SiliconFlowBot(Bot):
                 if model in [
                     const.DEEPSEEK_V3,
                     const.DEEPSEEK_R1,
-                    const.QWQ_32B,
                     const.GLM_4_9B,
                     const.GLM_Z1_9B,
                     const.GLM_Z1_R_32B,

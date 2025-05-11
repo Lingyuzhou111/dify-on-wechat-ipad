@@ -39,7 +39,7 @@ pip install -r requirements-optional.txt
 
 ### 3. 配置文件
 
-复制`config-template.json`为`config.json`，并修改关键配置（在原版基础上增加dify以外的LLM选项）：
+复制`config-template.json`为`config.json`，并修改关键配置（在原版基础上增加了dify以外的LLM选项，如coze、qwen、硅基免费模型等）：
 
 ```json
 {

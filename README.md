@@ -1,4 +1,4 @@
-# DoW-849 微信机器人
+# DoW-849-Beta版
 
 基于WX849协议的Dify-on-wechat项目，原版由An cool创建，此版本为本人自用版，已修复大部分已知bug（图片上传、XML消息发送和识别、语音发送等）。
 原版链接：https://github.com/AnCool-OvO/dify-on-wechat-ipad
@@ -38,7 +38,7 @@ pip install -r requirements-optional.txt
 
 ### 3. 配置文件
 
-复制`config-template.json`为`config.json`，并修改关键配置（在原版基础上增加调用dify以外的LLM选项）：
+复制`config-template.json`为`config.json`，并修改关键配置（在原版基础上增加dify以外的LLM选项）：
 
 ```json
 {

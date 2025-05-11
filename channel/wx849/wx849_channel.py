@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import json
 import time
 import threading
@@ -8,7 +9,6 @@ import sys
 import traceback  # 添加traceback模块导入
 import xml.etree.ElementTree as ET  # 在顶部添加ET导入
 import aiohttp  # 添加aiohttp模块导入
-import re  # 添加re模块导入
 from typing import Union, BinaryIO, Optional, Tuple, List, Dict
 import urllib.parse  # 添加urllib.parse模块导入
 import requests
@@ -28,7 +28,6 @@ from common.tmp_dir import TmpDir # Added for temporary file management
 # 新增HTTP服务器相关导入
 from aiohttp import web
 import uuid
-import re
 import base64
 import subprocess
 import math
@@ -1231,13 +1230,53 @@ class WX849Channel(ChatChannel):
                 logger.debug(f"[WX849] 群聊前缀配置: {group_chat_prefix}")
                 logger.debug(f"[WX849] 群聊关键词配置: {group_chat_keyword}")
                 
-                # 检查前缀匹配
+                # MODIFIED: Enhanced prefix checking for normal and quote messages
+                text_to_check_for_prefix = cmsg.content
+                is_quote_with_extracted_question = False
+                guide_prefix = ""
+                original_user_question_in_quote = ""
+                guide_suffix = "" # This will capture the quote marks and newlines after the user question
+
+                if hasattr(cmsg, 'is_processed_text_quote') and cmsg.is_processed_text_quote:
+                    # 确保 re 模块在这里是可用的
+                    import re # <--- 在这里显式导入一次
+                    match = re.match(r'(用户针对以下(?:消息|聊天记录)提问：“)(.*?)(”\n\n)', cmsg.content, re.DOTALL)
+                    if match:
+                        guide_prefix = match.group(1)  # "用户针对以下消息提问：“"
+                        original_user_question_in_quote = match.group(2) # "xy他说什么"
+                        guide_suffix = match.group(3)    # "”\n\n"
+                        text_to_check_for_prefix = original_user_question_in_quote
+                        is_quote_with_extracted_question = True
+                        logger.debug(f"[WX849] Quote message: Extracted text for prefix check: '{text_to_check_for_prefix}'")
+                    else:
+                        logger.debug(f"[WX849] Quote message format did not match extraction pattern: {cmsg.content[:100]}...")
+                
+                # Loop through configured prefixes
                 for prefix in group_chat_prefix:
-                    if prefix and cmsg.content.startswith(prefix):
-                        logger.debug(f"[WX849] 群聊匹配到前缀: {prefix}")
-                        # 去除前缀
-                        cmsg.content = cmsg.content[len(prefix):].strip()
-                        logger.debug(f"[WX849] 去除前缀后的内容: {cmsg.content}")
+                    if prefix and text_to_check_for_prefix.startswith(prefix):
+                        logger.debug(f"[WX849] Group chat matched prefix: '{prefix}' (on text: '{text_to_check_for_prefix[:50]}...')")
+                        cleaned_question_content = text_to_check_for_prefix[len(prefix):].strip()
+                        
+                        if is_quote_with_extracted_question:
+                            # Reconstruct cmsg.content with the cleaned question part, preserving the rest of the quote structure
+                            # The rest of the message starts after the original full guide + question + suffix part
+                            full_original_question_segment = guide_prefix + original_user_question_in_quote + guide_suffix
+                            if cmsg.content.startswith(full_original_question_segment):
+                                rest_of_message_after_quote_question = cmsg.content[len(full_original_question_segment):]
+                                cmsg.content = guide_prefix + cleaned_question_content + guide_suffix + rest_of_message_after_quote_question
+                                logger.debug(f"[WX849] Quote message, prefix removed. New content: {cmsg.content[:150]}...")
+                            else:
+                                # This fallback is less ideal as it might indicate an issue with segment identification
+                                logger.warning(f"[WX849] Quote message content did not start as expected with extracted segments. Attempting direct replacement of user question part.")
+                                # Attempt to replace only the original_user_question_in_quote part within the larger cmsg.content
+                                # This is safer if the rest_of_message_after_quote_question logic is not robust enough for all cases
+                                cmsg.content = cmsg.content.replace(original_user_question_in_quote, cleaned_question_content, 1)
+                                logger.debug(f"[WX849] Quote message, prefix removed via replace. New content: {cmsg.content[:150]}...")
+                        else:
+                            # For non-quote messages, the behavior is as before
+                            cmsg.content = cleaned_question_content
+                            logger.debug(f"[WX849] Non-quote message, prefix removed. New content: {cmsg.content}")
+                        
                         trigger_proceed = True
                         break
                 
@@ -2944,17 +2983,120 @@ class WX849Channel(ChatChannel):
         # 输出日志，显示完整XML内容
         logger.info(f"收到表情消息: ID:{cmsg.msg_id} 来自:{cmsg.from_user_id} 发送人:{cmsg.sender_wxid} \nXML内容: {cmsg.content}")
 
-    def _process_xml_message(self, cmsg):
+    def _process_xml_message(self, cmsg: WX849Message):
         """处理XML消息"""
-        # 只保留re模块的导入
-        import re
-        import xml.etree.ElementTree as ET # <--- 确保导入 ET
+        import xml.etree.ElementTree as ET
+        import re # re might be used by other parts of the original XML processing
 
-        # 先默认设置为XML类型，添加错误处理
+        # Attempt to parse as a text quote first
+        try:
+            if isinstance(cmsg.content, str) and cmsg.content.strip().startswith(("<msg", "<?xml")):
+                root = ET.fromstring(cmsg.content)
+                appmsg_node = root.find(".//appmsg") # Find appmsg anywhere in the XML
+                if appmsg_node is not None:
+                    msg_type_node = appmsg_node.find("type")
+                    if msg_type_node is not None and msg_type_node.text == "57":
+                        refermsg_node = appmsg_node.find("refermsg")
+                        if refermsg_node is not None:
+                            refer_type_node = refermsg_node.find("type")
+                            if refer_type_node is not None and refer_type_node.text == "1": # Text quote
+                                title_node = appmsg_node.find("title") # User's question
+                                refer_content_node = refermsg_node.find("content") # Quoted text
+                                refer_displayname_node = refermsg_node.find("displayname") # Quoted user's display name
+
+                                user_question = title_node.text if title_node is not None and title_node.text else ""
+                                quoted_text = refer_content_node.text if refer_content_node is not None and refer_content_node.text else ""
+                                quoter_display_name = refer_displayname_node.text if refer_displayname_node is not None and refer_displayname_node.text else "对方"
+
+                                if user_question and quoted_text:
+                                    cmsg.content = (
+                                        f"用户针对以下消息提问：\"{user_question}\"\n\n"
+                                        f"被引用的消息来自\"{quoter_display_name}\"：\n\"{quoted_text}\"\n\n"
+                                        f"请基于被引用的消息回答用户的问题。"
+                                    )
+                                    cmsg.is_processed_text_quote = True
+                                    # Ensure ctype is XML, as chat_channel expects to see XML type first
+                                    # It should already be set or will be set shortly, but good to be explicit.
+                                    try:
+                                        cmsg.ctype = ContextType.XML
+                                    except AttributeError: # ContextType.XML might not be defined if there was an issue earlier
+                                        if not hasattr(ContextType, 'XML'):
+                                            setattr(ContextType, 'XML', 'XML')
+                                        cmsg.ctype = ContextType.XML
+
+                                    # MODIFIED: If this is a processed quote in a group, change ctype to TEXT
+                                    # so it goes through the standard group trigger logic in handle_group.
+                                    if cmsg.is_group:
+                                        logger.debug(f"[WX849] Processed XML text quote (type 57) in group for msg {cmsg.msg_id}, converting ctype to TEXT for trigger evaluation.")
+                                        cmsg.ctype = ContextType.TEXT
+
+                                    logger.info(f"[WX849] 已成功将消息 ID {cmsg.msg_id} 解析为文本引用。新内容: {cmsg.content[:150]}...")
+                                    # self._extract_sender_from_xml(cmsg, root) # Optionally extract sender if needed for quote context
+                                    return # IMPORTANT: Return early to prevent other XML processing
+
+                            elif refer_type_node is not None and refer_type_node.text == "49": # Potentially chat history or other complex appmsg
+                                title_node = appmsg_node.find("title") # User's question (outer appmsg)
+                                nested_xml_str_node = refermsg_node.find("content") # Content of refermsg, which is an XML string
+                                refer_displayname_node = refermsg_node.find("displayname") # Display name of the user who forwarded
+
+                                user_question = title_node.text if title_node is not None and title_node.text else ""
+                                nested_xml_str = nested_xml_str_node.text if nested_xml_str_node is not None and nested_xml_str_node.text else ""
+                                quoter_display_name = refer_displayname_node.text if refer_displayname_node is not None and refer_displayname_node.text else "有人"
+
+                                if user_question and nested_xml_str:
+                                    try:
+                                        nested_root = ET.fromstring(nested_xml_str)
+                                        nested_appmsg_node = nested_root.find(".//appmsg") # Find appmsg in the nested XML
+                                        if nested_appmsg_node is not None:
+                                            inner_msg_type_node = nested_appmsg_node.find("type")
+                                            if inner_msg_type_node is not None and inner_msg_type_node.text == "19": # Type 19: Chat History
+                                                des_node = nested_appmsg_node.find("des")
+                                                chat_history_summary = des_node.text if des_node is not None and des_node.text else ""
+
+                                                if chat_history_summary:
+                                                    # Construct content string (ensure newlines are actual \n)
+                                                    cmsg.content = (
+                                                        f"用户针对以下聊天记录提问：“{user_question}”\n\n"
+                                                        f"以下是由“{quoter_display_name}”转发的聊天记录摘要：\n“{chat_history_summary}”\n\n"
+                                                        f"请基于聊天记录摘要回答用户的问题。"
+                                                    )
+                                                    cmsg.is_processed_text_quote = True # Reuse the flag
+                                                    try:
+                                                        cmsg.ctype = ContextType.XML
+                                                    except AttributeError:
+                                                        if not hasattr(ContextType, 'XML'):
+                                                            setattr(ContextType, 'XML', 'XML')
+                                                        cmsg.ctype = ContextType.XML
+
+                                                    # MODIFIED: If this is a processed quote in a group, change ctype to TEXT
+                                                    # so it goes through the standard group trigger logic in handle_group.
+                                                    if cmsg.is_group:
+                                                        logger.debug(f"[WX849] Processed XML chat history quote (type 49->19) in group for msg {cmsg.msg_id}, converting ctype to TEXT for trigger evaluation.")
+                                                        cmsg.ctype = ContextType.TEXT
+                                                    
+                                                    logger.info(f"[WX849] 已成功将消息 ID {cmsg.msg_id} 解析为引用的聊天记录 (type 19)。新内容: {cmsg.content[:150]}...")
+                                                    return # IMPORTANT: Return early
+                                                else:
+                                                    logger.debug(f"[WX849] Chat history (type 19) in refermsg for msg {cmsg.msg_id} has empty 'des' field.")
+                                            else:
+                                                logger.debug(f"[WX849] Nested appmsg in refermsg (type 49) for msg {cmsg.msg_id} is not type 19 chat history. Actual type: {inner_msg_type_node.text if inner_msg_type_node is not None else 'N/A'}")
+                                        else:
+                                            logger.debug(f"[WX849] No 'appmsg' found in nested XML of refermsg (type 49) for msg {cmsg.msg_id}.")
+                                    except ET.ParseError as e_nested:
+                                        logger.warning(f"[WX849] Failed to parse nested XML (refermsg content) for msg {cmsg.msg_id}: {e_nested}. Nested XML snippet: {nested_xml_str[:200]}")
+                                    except Exception as e_general_nested: # Catch any other unexpected errors during nested processing
+                                        logger.error(f"[WX849] Unexpected error processing nested XML for chat history in msg {cmsg.msg_id}: {e_general_nested}")
+
+        except ET.ParseError as e:
+            logger.debug(f"[WX849] XML parsing error during quote detection for msg {cmsg.msg_id}: {e}. Will proceed with generic XML handling.")
+        except Exception as e:
+            logger.warning(f"[WX849] Unexpected error during quote detection for msg {cmsg.msg_id}: {e}. Will proceed with generic XML handling.")
+
+        # Original XML processing logic starts here
+        # Ensure ctype is set to XML (this might be redundant if already set above, but acts as a fallback)
         try:
             cmsg.ctype = ContextType.XML
         except AttributeError:
-            # 如果XML类型不存在，尝试添加它
             logger.error("[WX849] ContextType.XML 不存在，尝试动态添加")
             if not hasattr(ContextType, 'XML'):
                 setattr(ContextType, 'XML', 'XML')
@@ -2962,7 +3104,6 @@ class WX849Channel(ChatChannel):
             try:
                 cmsg.ctype = ContextType.XML
             except:
-                # 如果仍然失败，回退到TEXT类型
                 logger.error("[WX849] 设置 ContextType.XML 失败，回退到 TEXT 类型")
                 cmsg.ctype = ContextType.TEXT
         
@@ -4540,84 +4681,6 @@ class WX849Channel(ChatChannel):
             logger.error(f"[WX849] 详细错误: {traceback.format_exc()}")
             return group_id
 
-    def _compose_context(self, ctype: ContextType, content, **kwargs):
-        """重写父类方法，构建消息上下文"""
-        try:
-            # 直接创建Context对象，确保结构正确
-            context = Context()
-            context.type = ctype
-            context.content = content
-            
-            # 获取消息对象
-            msg = kwargs.get('msg')
-            
-            # 检查是否是群聊消息
-            isgroup = kwargs.get('isgroup', False)
-            if isgroup and msg and hasattr(msg, 'from_user_id'):
-                # 设置群组相关信息
-                context["isgroup"] = True
-                context["from_user_nickname"] = msg.sender_wxid  # 发送者昵称
-                context["from_user_id"] = msg.sender_wxid  # 发送者ID
-                context["to_user_id"] = msg.to_user_id  # 接收者ID
-                context["other_user_id"] = msg.other_user_id or msg.from_user_id  # 群ID
-                context["group_name"] = msg.from_user_id  # 临时使用群ID作为群名
-                context["group_id"] = msg.from_user_id  # 群ID
-                context["msg"] = msg  # 消息对象
-                
-                # 设置session_id为群ID
-                context["session_id"] = msg.other_user_id or msg.from_user_id
-                
-                # 启动异步任务获取群名称并更新
-                loop = asyncio.get_event_loop()
-                try:
-                    # 尝试创建异步任务获取群名
-                    async def update_group_name():
-                        try:
-                            group_name = await self._get_group_name(msg.from_user_id)
-                            if group_name:
-                                context['group_name'] = group_name
-                                logger.debug(f"[WX849] 更新群名称: {group_name}")
-                        except Exception as e:
-                            logger.error(f"[WX849] 更新群名称失败: {e}")
-                    
-                    # 使用已有事件循环运行更新任务
-                    def run_async_task():
-                        try:
-                            asyncio.run(update_group_name())
-                        except Exception as e:
-                            logger.error(f"[WX849] 异步获取群名称任务失败: {e}")
-                    
-                    # 启动线程执行异步任务
-                    threading.Thread(target=run_async_task).start()
-                except Exception as e:
-                    logger.error(f"[WX849] 创建获取群名称任务失败: {e}")
-            else:
-                # 私聊消息
-                context["isgroup"] = False
-                context["from_user_nickname"] = msg.sender_wxid if msg and hasattr(msg, 'sender_wxid') else ""
-                context["from_user_id"] = msg.sender_wxid if msg and hasattr(msg, 'sender_wxid') else ""
-                context["to_user_id"] = msg.to_user_id if msg and hasattr(msg, 'to_user_id') else ""
-                context["other_user_id"] = None
-                context["msg"] = msg
-                
-                # 设置session_id为发送者ID
-                context["session_id"] = msg.sender_wxid if msg and hasattr(msg, 'sender_wxid') else ""
-
-            # 添加接收者信息
-            context["receiver"] = msg.from_user_id if isgroup else msg.sender_wxid
-            
-            # 记录原始消息类型
-            context["origin_ctype"] = ctype
-            
-            # 添加调试日志
-            logger.debug(f"[WX849] 生成Context对象: type={context.type}, content={context.content}, isgroup={context['isgroup']}, session_id={context.get('session_id', 'None')}")
-            
-            return context
-        except Exception as e:
-            logger.error(f"[WX849] 构建上下文失败: {e}")
-            logger.error(f"[WX849] 详细错误: {traceback.format_exc()}")
-            return None
-
     async def _get_chatroom_member_nickname(self, group_id, member_wxid):
         """获取群成员的昵称"""
         if not group_id or not member_wxid:
@@ -4936,30 +4999,30 @@ class WX849Channel(ChatChannel):
                 # 设置session_id为群ID
                 context["session_id"] = msg.other_user_id or msg.from_user_id
                 
-                # 启动异步任务获取群名称并更新
-                loop = asyncio.get_event_loop()
-                try:
-                    # 尝试创建异步任务获取群名
-                    async def update_group_name():
-                        try:
-                            group_name = await self._get_group_name(msg.from_user_id)
-                            if group_name:
-                                context['group_name'] = group_name
-                                logger.debug(f"[WX849] 更新群名称: {group_name}")
-                        except Exception as e:
-                            logger.error(f"[WX849] 更新群名称失败: {e}")
-                    
-                    # 使用已有事件循环运行更新任务
-                    def run_async_task():
-                        try:
-                            asyncio.run(update_group_name())
-                        except Exception as e:
-                            logger.error(f"[WX849] 异步获取群名称任务失败: {e}")
-                    
-                    # 启动线程执行异步任务
-                    threading.Thread(target=run_async_task).start()
-                except Exception as e:
-                    logger.error(f"[WX849] 创建获取群名称任务失败: {e}")
+                # # 启动异步任务获取群名称并更新
+                # loop = asyncio.get_event_loop() 
+                # try:
+                #     # 尝试创建异步任务获取群名
+                #     async def update_group_name():
+                #         try:
+                #             group_name = await self._get_group_name(msg.from_user_id)
+                #             if group_name:
+                #                 context['group_name'] = group_name
+                #                 logger.debug(f"[WX849] 更新群名称: {group_name}")
+                #         except Exception as e:
+                #             logger.error(f"[WX849] 更新群名称失败: {e}")
+                #     
+                #     # 使用已有事件循环运行更新任务
+                #     def run_async_task():
+                #         try:
+                #             asyncio.run(update_group_name())
+                #         except Exception as e:
+                #             logger.error(f"[WX849] 异步获取群名称任务失败: {e}")
+                #     
+                #     # 启动线程执行异步任务
+                #     threading.Thread(target=run_async_task).start()
+                # except Exception as e:
+                #     logger.error(f"[WX849] 创建获取群名称任务失败: {e}")
             else:
                 # 私聊消息
                 context["isgroup"] = False

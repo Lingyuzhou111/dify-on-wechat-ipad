@@ -7,9 +7,28 @@ RED='\033[0;31m'
 YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
+# 定义端口
+REDIS_PORT=6379
+PAD_PORT=9011
+
 echo -e "${BLUE}+------------------------------------------------+${NC}"
 echo -e "${BLUE}|         WX849 Protocol Service Starter         |${NC}"
 echo -e "${BLUE}+------------------------------------------------+${NC}"
+
+# 检查端口是否被占用
+check_port() {
+    local port=$1
+    local service=$2
+    if lsof -i :$port > /dev/null 2>&1; then
+        echo -e "${RED}错误: $service 端口 $port 已被占用!${NC}"
+        echo -e "${YELLOW}解决方案:${NC}"
+        echo -e "1. 查看占用进程: ${BLUE}sudo lsof -i :$port${NC}"
+        echo -e "2. 停止占用进程: ${BLUE}sudo kill -9 \$(sudo lsof -t -i :$port)${NC}"
+        echo -e "3. 或者修改 $service 配置使用其他端口"
+        return 1
+    fi
+    return 0
+}
 
 # 获取脚本所在目录
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -17,14 +36,35 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # 第一步：启动Redis服务
 echo -e "${YELLOW}[1/3] 正在启动Redis服务...${NC}"
+
+# 检查Redis端口
+if ! check_port $REDIS_PORT "Redis"; then
+    exit 1
+fi
+
 cd $PROJECT_ROOT/lib/wx849/849/redis
-redis-server redis.conf &
+redis-server redis.linux.conf &
 REDIS_PID=$!
-echo -e "${GREEN}Redis服务已启动，PID: $REDIS_PID${NC}"
+
+# 检查Redis是否启动成功
 sleep 2
+if ! ps -p $REDIS_PID > /dev/null; then
+    echo -e "${RED}Redis启动失败! 请检查日志:${NC}"
+    echo -e "${BLUE}cat $PROJECT_ROOT/lib/wx849/849/redis/redis.log${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}Redis服务已启动，PID: $REDIS_PID${NC}"
 
 # 第二步：启动PAD服务
 echo -e "${YELLOW}[2/3] 正在启动 PAD 服务...${NC}"
+
+# 检查PAD端口
+if ! check_port $PAD_PORT "PAD"; then
+    echo -e "${RED}正在关闭Redis服务...${NC}"
+    kill $REDIS_PID
+    exit 1
+fi
 
 # 读取配置文件中的协议版本
 PROTOCOL_VERSION=$(grep "wx849_protocol_version" $PROJECT_ROOT/config.json | grep -o '"[0-9][0-9][0-9]"' | tr -d '"')
@@ -62,7 +102,6 @@ if [ -f "linuxService" ]; then
     chmod +x linuxService
     ./linuxService &
     PAD_PID=$!
-    echo -e "${GREEN}PAD服务已启动，PID: $PAD_PID${NC}"
 elif [ -f "linuxService.exe" ]; then
     wine linuxService.exe &
     PAD_PID=$!
@@ -74,7 +113,20 @@ else
     exit 1
 fi
 
+# 检查PAD是否启动成功
 sleep 3
+if ! ps -p $PAD_PID > /dev/null; then
+    echo -e "${RED}PAD服务启动失败! 可能原因:${NC}"
+    echo -e "1. 端口冲突 (检查 $PAD_PORT 端口)"
+    echo -e "2. 缺少依赖库"
+    echo -e "3. 权限问题"
+    echo -e "${YELLOW}请查看日志文件获取更多信息${NC}"
+    echo -e "${RED}正在关闭Redis服务...${NC}"
+    kill $REDIS_PID
+    exit 1
+fi
+
+echo -e "${GREEN}PAD服务已启动，PID: $PAD_PID${NC}"
 
 # 第三步：配置并启动主程序
 echo -e "${YELLOW}[3/3] 配置完成，请扫描二维码登录微信...${NC}"
@@ -93,4 +145,4 @@ echo -e "${BLUE}+------------------------------------------------+${NC}"
 wait $PAD_PID
 echo -e "${RED}PAD服务已停止，正在关闭Redis服务...${NC}"
 kill $REDIS_PID
-echo -e "${RED}所有服务已关闭${NC}" 
+echo -e "${RED}所有服务已关闭${NC}"

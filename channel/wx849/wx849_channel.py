@@ -6,13 +6,15 @@ import time
 import threading
 import io
 import sys
-import traceback  # 添加traceback模块导入
-import xml.etree.ElementTree as ET  # 在顶部添加ET导入
-import aiohttp  # 添加aiohttp模块导入
+import traceback 
+import xml.etree.ElementTree as ET  
+import cv2
+import aiohttp
+import uuid 
 from typing import Union, BinaryIO, Optional, Tuple, List, Dict
-import urllib.parse  # 添加urllib.parse模块导入
+import urllib.parse  
 import requests
-from bridge.context import Context, ContextType  # 确保导入Context类
+from bridge.context import Context, ContextType  
 from bridge.reply import Reply, ReplyType
 from channel.chat_channel import ChatChannel
 from channel.chat_message import ChatMessage
@@ -25,9 +27,10 @@ from common.utils import remove_markdown_symbol, split_string_by_utf8_length
 from config import conf, get_appdata_dir
 from voice.audio_convert import split_audio # Added for voice splitting
 from common.tmp_dir import TmpDir # Added for temporary file management
+from plugins import PluginManager, EventContext, Event
 # 新增HTTP服务器相关导入
 from aiohttp import web
-import uuid
+from pathlib import Path
 import base64
 import subprocess
 import math
@@ -3290,6 +3293,8 @@ class WX849Channel(ChatChannel):
             for item in data:
                 new_list.append(self._create_loggable_params(item)) # 递归调用
             return new_list
+        elif isinstance(data, bytes): # <--- 新增对 bytes 类型的处理
+            return f"<binary_bytes_data len={len(data)} bytes>"
         elif isinstance(data, str):
             if self._is_likely_base64_for_log(data):
                 # 截断并添加长度指示器，类似 gemini_image.py 的做法
@@ -3533,6 +3538,16 @@ class WX849Channel(ChatChannel):
                     logger.error("[WX849] 发送图片失败: BytesIO对象为空")
                     return None
                 image_base64 = base64.b64encode(image_data).decode('utf-8')
+
+            elif isinstance(image_source, bytes):
+                # 处理bytes对象
+                logger.debug("[WX849] 处理 bytes 类型的图片源")
+                image_data = image_source
+                if not image_data:
+                    logger.error("[WX849] 发送图片失败: bytes 对象为空")
+                    return None
+                image_base64 = base64.b64encode(image_data).decode('utf-8')
+
             # --- 新增处理 BufferedReader 的分支 ---
             elif isinstance(image_source, io.BufferedReader):
                 # 处理 BufferedReader 对象 - 改为获取路径并重新读取
@@ -3597,161 +3612,171 @@ class WX849Channel(ChatChannel):
             logger.error(traceback.format_exc())
             return None
 
-    async def _send_video(self, to_user_id, video_details):
-        """发送视频的异步方法
-        支持多种输入格式:
-        1. 字典格式 {"video": 视频数据, "thumbnail": 封面图数据, "duration": 时长}
-        2. 直接提供base64编码的视频和封面图
+    async def _prepare_video_and_thumb(self, video_url: str, session_id: str) -> dict:
         """
+        异步下载视频，提取缩略图和时长。
+        返回包含 video_path, thumb_path, duration 的字典，失败则返回 None。
+        """
+        tmp_dir = TmpDir().path()
+        # 使用 uuid 生成更独特的文件名，避免仅依赖 session_id 和时间戳可能产生的冲突
+        unique_id = str(uuid.uuid4())
+        video_file_name = f"tmp_video_{session_id}_{unique_id}.mp4" # 假设是mp4
+        video_file_path = os.path.join(tmp_dir, video_file_name)
+        thumb_file_name = f"tmp_thumb_{session_id}_{unique_id}.jpg"
+        thumb_file_path = os.path.join(tmp_dir, thumb_file_name)
+
+        video_downloaded = False
         try:
-            # 检查参数
-            if not to_user_id:
-                logger.error("[WX849] 发送视频失败: 接收者ID为空")
-                return None
-
-            # 支持两种输入格式：字典格式和直接的base64字符串
-            video_base64 = None
-            thumbnail_base64 = None
-            video_duration = 10  # 默认10秒
-
-            if isinstance(video_details, dict):
-                # 处理字典格式输入
-                video_input = video_details.get("video")
-                thumbnail_input = video_details.get("thumbnail")
-                video_duration = video_details.get("duration", 10)
-
-                if not video_input:
-                    logger.error(f"[WX849] 发送视频失败: 缺少必要的视频数据")
-                    return None
-
-                import base64
-                import io
-                import os
-
-                # 处理视频数据
-                if isinstance(video_input, str):
-                    if video_input.startswith('data:video/mp4;base64,'):
-                        # 已经是base64编码字符串，直接使用
-                        video_base64 = video_input
-                    elif os.path.exists(video_input):
-                        # 视频文件路径
-                        with open(video_input, "rb") as f:
-                            video_data = f.read()
-                            video_base64 = "data:video/mp4;base64," + base64.b64encode(video_data).decode('utf-8')
+            # 1. 异步下载视频
+            async with aiohttp.ClientSession() as session:
+                async with session.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as resp: # 60秒超时
+                    if resp.status == 200:
+                        with open(video_file_path, 'wb') as f:
+                            while True:
+                                chunk = await resp.content.read(1024) # 读取块
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                        video_downloaded = True
+                        logger.debug(f"[WX849] Video downloaded to {video_file_path} from {video_url}")
                     else:
-                        # 尝试直接作为base64字符串使用
-                        video_base64 = "data:video/mp4;base64," + video_input
-                elif isinstance(video_input, io.BytesIO):
-                    video_data = video_input.getvalue()
-                    video_base64 = "data:video/mp4;base64," + base64.b64encode(video_data).decode('utf-8')
-                elif isinstance(video_input, bytes):
-                    video_data = video_input
-                    video_base64 = "data:video/mp4;base64," + base64.b64encode(video_data).decode('utf-8')
-                else:
-                    logger.error(f"[WX849] 发送视频失败: 不支持的视频输入类型 {type(video_input)}")
-                    return None
+                        logger.error(f"[WX849] Failed to download video from {video_url}. Status: {resp.status}")
+                        return None
+        except Exception as e:
+            logger.error(f"[WX849] Exception during video download from {video_url}: {e}", exc_info=True)
+            if os.path.exists(video_file_path): # 如果下载部分成功但后续出错，清理掉
+                os.remove(video_file_path)
+            return None
 
-                # 处理封面图数据
-                if thumbnail_input:
-                    if isinstance(thumbnail_input, str):
-                        if thumbnail_input.startswith('data:image/jpeg;base64,'):
-                            # 已经是base64编码字符串，直接使用
-                            thumbnail_base64 = thumbnail_input
-                        elif os.path.exists(thumbnail_input):
-                            # 图片文件路径
-                            with open(thumbnail_input, "rb") as f:
-                                thumbnail_data = f.read()
-                                thumbnail_base64 = "data:image/jpeg;base64," + base64.b64encode(thumbnail_data).decode('utf-8')
-                        else:
-                            # 尝试直接作为base64字符串使用
-                            thumbnail_base64 = "data:image/jpeg;base64," + thumbnail_input
-                    elif isinstance(thumbnail_input, io.BytesIO):
-                        thumbnail_data = thumbnail_input.getvalue()
-                        thumbnail_base64 = "data:image/jpeg;base64," + base64.b64encode(thumbnail_data).decode('utf-8')
-                    elif isinstance(thumbnail_input, bytes):
-                        thumbnail_data = thumbnail_input
-                        thumbnail_base64 = "data:image/jpeg;base64," + base64.b64encode(thumbnail_data).decode('utf-8')
-                    else:
-                        logger.error(f"[WX849] 封面图类型不支持: {type(thumbnail_input)}，将使用默认封面")
-                
-                # 验证时长参数
-                if not isinstance(video_duration, (int, float)) or video_duration <= 0:
-                    logger.warning(f"[WX849] 无效的视频时长: {video_duration}，使用默认值10秒")
-                    video_duration = 10
+        if not video_downloaded:
+            return None
+
+        # 2. 使用 OpenCV 处理视频，提取缩略图和时长
+        duration = 0
+        thumb_generated = False
+        cap = None # 初始化 cap
+        try:
+            cap = cv2.VideoCapture(video_file_path)
+            if not cap.isOpened():
+                logger.error(f"[WX849] OpenCV could not open video file: {video_file_path}")
+                # 不需要在这里删除 video_file_path，send_video 的 finally 会处理
+                return {"video_path": video_file_path, "thumb_path": None, "duration": 0} # 返回部分信息
+
+            # 获取时长
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            if fps > 0 and frame_count > 0:
+                duration = int(frame_count / fps)
             else:
-                # 直接传入base64字符串
-                video_base64 = video_details
-                # 使用默认封面
-                logger.debug("[WX849] 使用默认封面图片")
+                logger.warning(f"[WX849] Could not get valid fps ({fps}) or frame_count ({frame_count}) for {video_file_path}. Duration set to 0.")
+                duration = 0 # 或设置为一个默认值，或标记为未知
 
-            # 处理视频base64前缀
-            if video_base64 and not video_base64.startswith('data:video/mp4;base64,'):
-                video_base64 = "data:video/mp4;base64," + video_base64
+            # 提取第一帧作为缩略图
+            ret, frame = cap.read()
+            if ret:
+                # 有些视频可能需要旋转，这里暂不处理旋转，直接保存帧
+                # 可以考虑Pillow进行更精细的图片处理和保存，但cv2.imwrite通常足够
+                cv2.imwrite(thumb_file_path, frame) 
+                thumb_generated = True
+                logger.debug(f"[WX849] Thumbnail generated for {video_file_path} at {thumb_file_path}. Duration: {duration}s")
+            else:
+                logger.warning(f"[WX849] Could not read frame from video {video_file_path} to generate thumbnail.")
+        
+        except Exception as e:
+            logger.error(f"[WX849] Exception during OpenCV video processing for {video_file_path}: {e}", exc_info=True)
+            # 即使处理失败，视频已下载，返回视频路径和获取到的时长（可能为0）
+            # thumb_path 将为 None（如果之前未成功生成）
+            # 不需要在这里删除 video_file_path，send_video 的 finally 会处理
+            return {"video_path": video_file_path, "thumb_path": None, "duration": duration}
+        finally:
+            if cap:
+                cap.release()
+        
+        return {
+            "video_path": video_file_path,
+            "thumb_path": thumb_file_path if thumb_generated else None,
+            "duration": duration
+        }
 
-            # 设置默认封面(如果没有提供)
-            if not thumbnail_base64 or thumbnail_base64 == "None":
-                try:
-                    # 使用1x1像素的透明PNG作为最小封面
-                    thumbnail_base64 = "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
-                    logger.debug("[WX849] 使用内置1x1像素作为默认封面")
-                except Exception as e:
-                    logger.error(f"[WX849] 准备默认封面图片失败: {e}")
-                    # 使用1x1像素的透明PNG作为最小封面
-                    thumbnail_base64 = "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
-                    logger.debug("[WX849] 使用内置1x1像素作为默认封面")
+    async def send_video(self, to_wxid: str, video_url: str, session_id: str):
+        """
+        下载视频URL，准备视频路径、缩略图路径和时长，
+        然后调用 self.api_client.send_video_message 发送。
+        """
+        logger.info(f"[WX849] Preparing video from URL: {video_url} for recipient {to_wxid} (session: {session_id})")
+        prepared_video_info = await self._prepare_video_and_thumb(video_url, session_id)
 
-            # 处理封面base64前缀
-            if thumbnail_base64 and not thumbnail_base64.startswith('data:image/jpeg;base64,'):
-                thumbnail_base64 = "data:image/jpeg;base64," + thumbnail_base64
+        if not prepared_video_info or not prepared_video_info.get("video_path"):
+            logger.error(f"[WX849] Failed to prepare video and thumbnail for URL: {video_url}")
+            return None 
 
-            # 打印预估时间
-            try:
-                # 获取纯base64内容计算大小
-                pure_video_base64 = video_base64
-                if pure_video_base64.startswith("data:video/mp4;base64,"):
-                    pure_video_base64 = pure_video_base64[len("data:video/mp4;base64,"):]
+        video_path = prepared_video_info["video_path"]
+        thumb_path = prepared_video_info.get("thumb_path") # May be None if fallback is used or generation failed
+        # duration = prepared_video_info.get("duration", 0) # api_client.send_video_message will recalculate duration
 
-                # 计算文件大小 (KB)
-                import base64
-                file_len = len(base64.b64decode(pure_video_base64)) / 1024
+        if not os.path.exists(video_path): # Double check, _prepare_video_and_thumb should ensure this
+            logger.error(f"[WX849] Prepared video file does not exist after _prepare_video_and_thumb: {video_path}")
+            return None
 
-                # 预估时间 (秒)，按300KB/s计算
-                predict_time = int(file_len / 300)
-                logger.info(f"[WX849] 开始发送视频: 预计{predict_time}秒, 视频大小:{file_len:.2f}KB, 时长:{video_duration}秒")
-            except Exception as e:
-                logger.debug(f"[WX849] 计算预估时间失败: {e}")
+        # thumb_path can be None, send_video_message handles a None image by using a fallback.
+        # If thumb_path is provided but doesn't exist, it's an issue.
+        if thumb_path and not os.path.exists(thumb_path):
+            logger.warning(f"[WX849] Prepared thumbnail file does not exist: {thumb_path}. Passing None to API client.")
+            thumb_path = None 
 
-            # 构建API参数
-            params = {
-                "Wxid": self.wxid,
-                "ToWxid": to_user_id,
-                "Base64": video_base64,
-                "ImageBase64": thumbnail_base64,
-                "PlayLength": video_duration  # 必需参数，缺少会导致[Key:]数据不存在错误
-            }
+        try:
+            logger.info(f"[WX849] Calling api_client.send_video_message. ToWxid: {to_wxid}, VideoPath: {video_path}, ThumbPath: {thumb_path if thumb_path else 'Default'}")
+            
+            # self.api_client 应该是指向 WechatAPI.Client 的实例
+            if hasattr(self.bot, 'send_video_message'): # <--- 修改点 1
+                # --- BEGIN MODIFICATION ---
+                video_path_obj = Path(video_path) # video_path 此时必定存在，前面有检查
 
-            # 调用API
-            result = await self._call_api("/Msg/SendVideo", params)
+                # 只有当 thumb_path 存在且是一个有效文件时才创建 Path 对象，否则为 None
+                image_path_obj = Path(thumb_path) if thumb_path and os.path.exists(thumb_path) else None
+                
+                # 再次确认 video_path_obj 是否有效 (虽然 _prepare_video_and_thumb 和前面的检查应该保证了)
+                if not os.path.exists(video_path_obj):
+                    logger.error(f"[WX849] Video path object {video_path_obj} does not exist before API call.")
+                    return {"Success": False, "Msg": f"Video path {video_path_obj} vanished."}
 
-            # 检查结果
-            if result and isinstance(result, dict):
-                success = result.get("Success", False)
-                if success:
-                    data = result.get("Data", {})
-                    client_msg_id = data.get("clientMsgId")
-                    new_msg_id = data.get("newMsgId")
-                    logger.info(f"[WX849] 视频发送成功，返回ID: {client_msg_id}, {new_msg_id}")
+                result_tuple = await self.bot.send_video_message(
+                    wxid=to_wxid, 
+                    video=video_path_obj,  # 传递 Path 对象
+                    image=image_path_obj   # 传递 Path 对象或 None
+                )
+                # --- END MODIFICATION ---
+                
+                if result_tuple and isinstance(result_tuple, tuple) and len(result_tuple) == 2:
+                    logger.info(f"[WX849] Video sent successfully via self.bot.send_video_message to {to_wxid}. ClientMsgId: {result_tuple[0]}, NewMsgId: {result_tuple[1]}")
+                    result = {"Success": True, "Data": {"clientMsgId": result_tuple[0], "newMsgId": result_tuple[1]}, "Msg": "Sent successfully"}
                 else:
-                    error_msg = result.get("Message", "未知错误")
-                    logger.error(f"[WX849] 视频API返回错误: {error_msg}")
-                    logger.error(f"[WX849] 响应详情: {json.dumps(result, ensure_ascii=False)}")
+                    logger.error(f"[WX849] self.bot.send_video_message to {to_wxid} did not return expected tuple or may have failed silently. Response: {result_tuple}")
+                    result = {"Success": False, "Data": result_tuple, "Msg": "API call may have failed or returned unexpected data."}
+            else:
+                logger.error("[WX849] self.bot does not have send_video_message method.") # <--- 修改点 3
+                result = {"Success": False, "Msg": "Bot object is missing send_video_message method."}
             
             return result
+
         except Exception as e:
-            logger.error(f"[WX849] 发送视频失败: {e}")
-            import traceback
-            logger.error(f"[WX849] 详细错误: {traceback.format_exc()}")
-            return None
+            # 如果 self.api_client.send_video_message 内部的 error_handler 抛出异常，这里会捕获
+            logger.error(f"[WX849] Exception when calling api_client.send_video_message for {to_wxid}: {e}", exc_info=True)
+            return {"Success": False, "Msg": str(e)} # 返回包含错误信息的字典
+        finally:
+            # 清理 _prepare_video_and_thumb 创建的临时文件
+            if os.path.exists(video_path):
+                try:
+                    os.remove(video_path)
+                    logger.debug(f"[WX849] Cleaned up temp video file: {video_path}")
+                except Exception as e_clean:
+                    logger.warning(f"[WX849] Failed to clean up temp video file {video_path}: {e_clean}")
+            if thumb_path and os.path.exists(thumb_path): # 只有当 thumb_path 不是 None 且实际存在时才尝试删除
+                try:
+                    os.remove(thumb_path)
+                    logger.debug(f"[WX849] Cleaned up temp thumb file: {thumb_path}")
+                except Exception as e_clean:
+                    logger.warning(f"[WX849] Failed to clean up temp thumb file {thumb_path}: {e_clean}")
 
     def send(self, reply: Reply, context: Context):
         """发送消息"""
@@ -3827,121 +3852,7 @@ class WX849Channel(ChatChannel):
                 logger.info(f"[WX849] 发送图片成功: 接收者: {receiver}")
             else:
                 logger.warning(f"[WX849] 发送图片可能失败: 接收者: {receiver}, 结果: {result}")
-        
-        elif reply.type == ReplyType.VIDEO:
-            video_content = reply.content
-            tmp_video_path = None
-            tmp_thumb_path = None
-            
-            try:
-                if isinstance(video_content, dict):
-                    # 处理预先准备好的视频详情字典
-                    logger.debug("[WX849] 发送预处理的视频数据")
-                    result = loop.run_until_complete(self._send_video(receiver, video_content))
                 
-                elif isinstance(video_content, str) and cv2 is not None: # 处理视频URL
-                    video_url = video_content
-                    logger.info(f"[WX849] 收到视频URL，开始处理: {video_url}")
-                    
-                    # 确保 tmp 目录存在
-                    tmp_dir = get_appdata_dir()
-                    if not os.path.exists(tmp_dir):
-                        os.makedirs(tmp_dir)
-                    
-                    # 1. 下载视频
-                    ts = int(time.time())
-                    tmp_video_path = os.path.join(tmp_dir, f"tmp_video_{ts}.mp4")
-                    logger.debug(f"[WX849] 下载视频到: {tmp_video_path}")
-                    
-                    try:
-                        res = requests.get(video_url, stream=True, timeout=60) # 增加超时
-                        res.raise_for_status() # 检查HTTP错误
-                        with open(tmp_video_path, 'wb') as f:
-                            for chunk in res.iter_content(chunk_size=8192):
-                                f.write(chunk)
-                        logger.debug(f"[WX849] 视频下载完成")
-                    except requests.exceptions.RequestException as e:
-                        logger.error(f"[WX849] 下载视频失败: {e}")
-                        return
-                    except Exception as e:
-                        logger.error(f"[WX849] 保存视频文件失败: {e}")
-                        return
-
-                    # 2. 使用 OpenCV 获取时长和缩略图
-                    logger.debug(f"[WX849] 使用OpenCV处理视频: {tmp_video_path}")
-                    cap = cv2.VideoCapture(tmp_video_path)
-                    if not cap.isOpened():
-                        logger.error(f"[WX849] 无法打开视频文件: {tmp_video_path}")
-                        return
-
-                    # 获取时长
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    duration = math.ceil(frame_count / fps) if fps > 0 else 0
-                    logger.debug(f"[WX849] 视频信息 - FPS: {fps}, 帧数: {frame_count}, 时长: {duration}s")
-                    
-                    # 获取缩略图 (第一帧)
-                    success, frame = cap.read()
-                    cap.release() # 及时释放资源
-                    
-                    if not success:
-                        logger.error(f"[WX849] 无法读取视频帧用于缩略图")
-                        return
-                        
-                    tmp_thumb_path = os.path.join(tmp_dir, f"tmp_thumb_{ts}.jpg")
-                    logger.debug(f"[WX849] 保存缩略图到: {tmp_thumb_path}")
-                    if not cv2.imwrite(tmp_thumb_path, frame):
-                       logger.error(f"[WX849] 保存缩略图失败: {tmp_thumb_path}")
-                       return
-
-                    # 3. 构建 video_details 并发送
-                    video_details = {
-                        "video": tmp_video_path,
-                        "thumbnail": tmp_thumb_path,
-                        "duration": duration
-                    }
-                    logger.debug(f"[WX849] 准备发送处理后的视频")
-                    result = loop.run_until_complete(self._send_video(receiver, video_details))
-                    
-                elif isinstance(video_content, str) and cv2 is None:
-                    logger.error("[WX849] 收到视频URL，但未安装opencv-python，无法处理")
-                    result = None # 标记为失败
-                
-                else:
-                    logger.error(f"[WX849] 发送视频失败: 不支持的 reply.content 类型: {type(video_content)}")
-                    result = None # 标记为失败
-                    
-                # 日志记录发送结果
-                if result and isinstance(result, dict) and result.get("Success", False):
-                    logger.info(f"[WX849] 发送视频成功: 接收者: {receiver}")
-                else:
-                    # 增加详细的失败原因日志
-                    reason = "处理失败或API返回错误"
-                    if isinstance(video_content, str) and cv2 is None:
-                        reason = "未安装opencv-python"
-                    elif not isinstance(video_content, (dict, str)):
-                        reason = f"不支持的内容类型 {type(video_content)}"
-                    logger.warning(f"[WX849] 发送视频可能失败: 接收者: {receiver}, 原因: {reason}, API结果: {result}")
-
-            except Exception as e:
-                logger.error(f"[WX849] 处理并发送视频时发生意外错误: {e}")
-                import traceback
-                logger.error(f"[WX849] 详细错误: {traceback.format_exc()}")
-            finally:
-                # 清理临时文件
-                if tmp_video_path and os.path.exists(tmp_video_path):
-                    try:
-                        os.remove(tmp_video_path)
-                        logger.debug(f"[WX849] 已删除临时视频文件: {tmp_video_path}")
-                    except Exception as e:
-                        logger.error(f"[WX849] 删除临时视频文件失败: {e}")
-                if tmp_thumb_path and os.path.exists(tmp_thumb_path):
-                    try:
-                        os.remove(tmp_thumb_path)
-                        logger.debug(f"[WX849] 已删除临时缩略图文件: {tmp_thumb_path}")
-                    except Exception as e:
-                        logger.error(f"[WX849] 删除临时缩略图文件失败: {e}")
-        
         elif reply.type == ReplyType.APP:
             xml_content = reply.content
             logger.info(f"[WX849] APP message raw content type: {type(xml_content)}, content length: {len(xml_content)}")
@@ -3998,128 +3909,29 @@ class WX849Channel(ChatChannel):
                 logger.warning(f"[WX849] 发送系统消息可能失败: 接收者: {receiver}, 结果: {result}")
         
         elif reply.type == ReplyType.VIDEO_URL:
-            # 从网络下载视频URL并发送
-            video_url = reply.content
-            logger.info(f"[WX849] 开始处理视频URL: {video_url}")
-            tmp_video_path = None
-            tmp_thumb_path = None
-            
+            logger.info(f"[WX849] Received VIDEO_URL reply: {reply.content}")
+            to_wxid = context.get("receiver") # 使用 .get() 更安全
+            if not to_wxid:
+                logger.error("[WX849] Cannot send VIDEO_URL, receiver is not defined in context.")
+                return # 如果没有接收者，则返回
+
+            session_id = context.get("session_id") or context.get("msg", {}).get("msg_id") or self.get_random_session()
+            # 下面的 if not session_id 理论上不会执行，因为 or self.get_random_session() 保证了它有值
+            # 可以考虑移除这个 if 块，或者保留作为额外的日志点
+            if not session_id: # 这个判断在 or self.get_random_session() 后其实是多余的
+                session_id = self.get_random_session() # 这一行不会被执行
+                logger.warning(f"[WX849] session_id was unexpectedly still None for VIDEO_URL, using random: {session_id}")
+
             try:
-                # 确保opencv-python已安装
-                if cv2 is None:
-                    logger.error("[WX849] 无法处理视频URL: 未安装opencv-python库")
-                    # 发送错误消息给用户，通知安装依赖
-                    error_msg = "抱歉，服务器未安装视频处理库(OpenCV)，无法发送视频。请联系管理员安装 opencv-python 包。"
-                    loop.run_until_complete(self._send_message(receiver, error_msg))
-                    return
-                
-                # 确保tmp目录存在
-                tmp_dir = get_appdata_dir()
-                if not os.path.exists(tmp_dir):
-                    os.makedirs(tmp_dir)
-                
-                # 1. 下载视频
-                ts = int(time.time())
-                tmp_video_path = os.path.join(tmp_dir, f"tmp_video_{ts}.mp4")
-                logger.debug(f"[WX849] 下载视频到: {tmp_video_path}")
-                
-                try:
-                    res = requests.get(video_url, stream=True, timeout=60)
-                    res.raise_for_status()
-                    with open(tmp_video_path, 'wb') as f:
-                        for chunk in res.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    logger.debug(f"[WX849] 视频下载完成")
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"[WX849] 下载视频失败: {e}")
-                    error_msg = f"视频下载失败: {str(e)}"
-                    loop.run_until_complete(self._send_message(receiver, error_msg))
-                    return
-                
-                # 2. 使用OpenCV获取时长和缩略图
-                logger.debug(f"[WX849] 处理视频获取缩略图: {tmp_video_path}")
-                cap = cv2.VideoCapture(tmp_video_path)
-                if not cap.isOpened():
-                    logger.error(f"[WX849] 无法打开视频文件: {tmp_video_path}")
-                    error_msg = "视频处理失败: 无法打开视频文件"
-                    loop.run_until_complete(self._send_message(receiver, error_msg))
-                    return
-                
-                # 获取视频时长
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                duration = math.ceil(frame_count / fps) if fps > 0 else 10
-                logger.debug(f"[WX849] 视频信息 - FPS: {fps}, 帧数: {frame_count}, 时长: {duration}秒")
-                
-                # 获取缩略图 (第一帧)
-                success, frame = cap.read()
-                cap.release()
-                
-                if not success:
-                    logger.error(f"[WX849] 无法读取视频帧用于缩略图")
-                    # 使用默认缩略图
-                    import base64
-                    thumbnail_base64 = "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
-                    logger.debug("[WX849] 使用默认缩略图")
-                else:
-                    # 保存缩略图 - 保持原始尺寸
-                    tmp_thumb_path = os.path.join(tmp_dir, f"tmp_thumb_{ts}.jpg")
-                    # 不调整尺寸，直接保存原始帧
-                    if not cv2.imwrite(tmp_thumb_path, frame):
-                        logger.error(f"[WX849] 保存缩略图失败")
-                        # 使用默认缩略图
-                        import base64
-                        thumbnail_base64 = "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
-                        logger.debug("[WX849] 使用默认缩略图")
-                    else:
-                        # 记录缩略图尺寸信息
-                        height, width, _ = frame.shape
-                        logger.debug(f"[WX849] 缩略图尺寸: {width}x{height}")
-                        thumbnail_base64 = None  # 使用文件路径
-                
-                # 3. 构建视频详情并发送
-                video_details = {
-                    "video": tmp_video_path,
-                    "thumbnail": tmp_thumb_path if tmp_thumb_path and os.path.exists(tmp_thumb_path) else thumbnail_base64,
-                    "duration": duration
-                }
-                logger.debug(f"[WX849] 准备发送视频: {video_details}")
-                result = loop.run_until_complete(self._send_video(receiver, video_details))
-                
-                if result and isinstance(result, dict) and result.get("Success", False):
-                    logger.info(f"[WX849] 视频发送成功: 接收者: {receiver}")
-                else:
-                    logger.warning(f"[WX849] 视频发送可能失败: 接收者: {receiver}, 结果: {result}")
-                    # 尝试发送链接作为备用方案
-                    fallback_msg = f"视频发送失败，您可以通过以下链接查看视频: {video_url}"
-                    loop.run_until_complete(self._send_message(receiver, fallback_msg))
+                # loop 变量在 send 方法的开头定义
+                loop.run_until_complete(self.send_video(to_wxid, reply.content, session_id))
             except Exception as e:
-                logger.error(f"[WX849] 处理视频URL失败: {e}")
-                import traceback
-                logger.error(f"[WX849] 详细错误: {traceback.format_exc()}")
-                # 发送错误消息
-                error_msg = f"视频处理失败: {str(e)}"
-                try:
-                    loop.run_until_complete(self._send_message(receiver, error_msg))
-                    # 尝试发送链接作为备用方案
-                    fallback_msg = f"您可以通过以下链接查看视频: {video_url}"
-                    loop.run_until_complete(self._send_message(receiver, fallback_msg))
-                except:
-                    pass
-            finally:
-                # 清理临时文件
-                if tmp_video_path and os.path.exists(tmp_video_path):
-                    try:
-                        os.remove(tmp_video_path)
-                        logger.debug(f"[WX849] 已删除临时视频文件: {tmp_video_path}")
-                    except Exception as e:
-                        logger.error(f"[WX849] 删除临时视频文件失败: {e}")
-                if tmp_thumb_path and os.path.exists(tmp_thumb_path):
-                    try:
-                        os.remove(tmp_thumb_path)
-                        logger.debug(f"[WX849] 已删除临时缩略图文件: {tmp_thumb_path}")
-                    except Exception as e:
-                        logger.error(f"[WX849] 删除临时缩略图文件失败: {e}")
+                # send_video 内部已有详细日志，这里可以简化或根据需要调整
+                logger.error(f"[WX849] Error occurred in send_reply while processing VIDEO_URL: {str(e)}")
+                # 决定是否重新抛出异常
+                # raise 
+            
+            return
         
         elif reply.type == ReplyType.VOICE:
             original_voice_file_path = reply.content
@@ -5059,9 +4871,25 @@ class WX849Channel(ChatChannel):
             
             # 添加调试日志
             logger.debug(f"[WX849] 生成Context对象: type={context.type}, content={context.content}, isgroup={context['isgroup']}, session_id={context.get('session_id', 'None')}")
-            
-            return context
+
+            try:
+                # 手动触发 ON_RECEIVE_MESSAGE 事件
+                e_context = EventContext(Event.ON_RECEIVE_MESSAGE, {"channel": self, "context": context})
+                PluginManager().emit_event(e_context)
+                context = e_context["context"] # 获取可能被修改的 context
+
+                # 检查插件是否阻止了消息 或 清空了 context
+                if e_context.is_pass() or context is None:
+                    logger.info(f"[WX849] Event ON_RECEIVE_MESSAGE breaked or context is None by plugin {e_context.get('breaked_by', 'N/A')}. Returning early.")
+                    return context # 返回 None 或被插件修改的 context
+            except Exception as plugin_e:
+                logger.error(f"[WX849] Error during ON_RECEIVE_MESSAGE event processing: {plugin_e}", exc_info=True)
+                # 根据需要决定是否继续，这里选择继续返回原始 context
+            # --- 结束插入修改 ---
+
+            return context # 返回（可能被插件修改过的）context
         except Exception as e:
+            # ... (原有的错误处理 L4875-L4878) ...
             logger.error(f"[WX849] 构建上下文失败: {e}")
             logger.error(f"[WX849] 详细错误: {traceback.format_exc()}")
             return None

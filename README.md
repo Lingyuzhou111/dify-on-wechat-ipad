@@ -1,6 +1,6 @@
 # DoW-849-Beta版
 
-基于WX849协议的Dify-on-wechat项目，原版由An cool创建，此版本为本人自用版，已修复大部分已知bug（图片上传、语音发送、过滤非用户消息、XML消息发送和引用识别等）。
+基于WX849协议的Dify-on-wechat项目，此版本为本人自用版，已修复大部分已知bug（图片上传、语音发送、过滤非用户消息、XML消息发送和引用识别等）。
 
 原版链接：https://github.com/AnCool-OvO/dify-on-wechat-ipad
 

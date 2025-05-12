@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import binascii
 import os
 from asyncio import Future
 from asyncio import Queue, sleep
@@ -210,56 +211,147 @@ class MessageMixin(WechatAPIClientBase):
                     ValueError: 视频或图片参数都为空或都不为空时
                     根据error_handler处理错误
                 """
-        if not image:
-            image = Path(os.path.join(Path(__file__).resolve().parent, "fallback.png"))
-        # get video base64 and duration
-        if isinstance(video, str):
-            vid_base64 = video
-            video = base64.b64decode(video)
-            file_len = len(video)
-            media_info = MediaInfo.parse(BytesIO(video))
-        elif isinstance(video, bytes):
-            vid_base64 = base64.b64encode(video).decode()
-            file_len = len(video)
-            media_info = MediaInfo.parse(BytesIO(video))
-        elif isinstance(video, os.PathLike):
-            with open(video, "rb") as f:
-                file_len = len(f.read())
-                vid_base64 = base64.b64encode(f.read()).decode()
-            media_info = MediaInfo.parse(video)
-        else:
-            raise ValueError("video should be str, bytes, or path")
-        duration = media_info.tracks[0].duration
+        image_base64 = "" # Initialize to empty string
+        processed_image = False # Flag to track if image was successfully processed
+        DEFAULT_THUMB_BASE64_WITH_PREFIX = "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 
-        # get image base64
-        if isinstance(image, str):
-            image_base64 = image
+        if image is None:
+            logger.info("[WechatAPIClient] No explicit image provided for video thumbnail. Using default 1x1 black JPEG thumbnail.")
+            image_base64 = DEFAULT_THUMB_BASE64_WITH_PREFIX
+            processed_image = True
+        elif isinstance(image, os.PathLike): # 优先处理路径
+            if not os.path.exists(image):
+                logger.warning(f"[WechatAPIClient] Image path does not exist: {image}. Using default 1x1 black JPEG thumbnail.")
+                image_base64 = DEFAULT_THUMB_BASE64_WITH_PREFIX
+                processed_image = True # Considered processed with default
+            else:
+                try:
+                    with open(image, "rb") as f_img:
+                        pure_b64 = base64.b64encode(f_img.read()).decode()
+                        image_base64 = f"data:image/jpeg;base64,{pure_b64}"
+                        processed_image = True
+                except Exception as e:
+                    logger.error(f"[WechatAPIClient] Failed to read image from path {image}: {e}. Using default 1x1 black JPEG thumbnail.")
+                    image_base64 = DEFAULT_THUMB_BASE64_WITH_PREFIX
+                    processed_image = True # Considered processed with default
         elif isinstance(image, bytes):
-            image_base64 = base64.b64encode(image).decode()
-        elif isinstance(image, os.PathLike):
-            with open(image, "rb") as f:
-                image_base64 = base64.b64encode(f.read()).decode()
+            try:
+                pure_b64 = base64.b64encode(image).decode()
+                image_base64 = f"data:image/jpeg;base64,{pure_b64}"
+                processed_image = True
+            except Exception as e:
+                logger.error(f"[WechatAPIClient] Failed to encode image bytes: {e}. Using default 1x1 black JPEG thumbnail.")
+                image_base64 = DEFAULT_THUMB_BASE64_WITH_PREFIX
+                processed_image = True # Considered processed with default
+        elif isinstance(image, str): #假定是 Base64 字符串或带前缀的Base64
+            if image.startswith("data:image/jpeg;base64,") or image.startswith("data:image/png;base64,"): # Support PNG as well
+                image_base64 = image
+                processed_image = True
+            elif image: # Assume it's a pure base64 string
+                try:
+                    # Try to decode to check validity, then re-encode with prefix (or just add prefix)
+                    base64.b64decode(image) # Validate
+                    image_base64 = f"data:image/jpeg;base64,{image}" # Add JPEG prefix by default
+                    processed_image = True
+                except binascii.Error:
+                    logger.error(f"[WechatAPIClient] Invalid pure Base64 string provided for image: {image[:30]}... Using default thumbnail.")
+                    image_base64 = DEFAULT_THUMB_BASE64_WITH_PREFIX
+                    processed_image = True # Considered processed with default
+            else: # Empty string for image
+                logger.warning("[WechatAPIClient] Empty string provided for image. Using default 1x1 black JPEG thumbnail.")
+                image_base64 = DEFAULT_THUMB_BASE64_WITH_PREFIX
+                processed_image = True
         else:
-            raise ValueError("image should be str, bytes, or path")
+            logger.error(f"[WechatAPIClient] Invalid type for image argument: {type(image)}. Using default 1x1 black JPEG thumbnail.")
+            image_base64 = DEFAULT_THUMB_BASE64_WITH_PREFIX
+            processed_image = True
 
-        # 打印预估时间，300KB/s
-        predict_time = int(file_len / 1024 / 300)
-        logger.info("开始发送视频: 对方wxid:{} 视频base64略 图片base64略 预计耗时:{}秒", wxid, predict_time)
+        # 处理 video 参数
+        vid_base64_str = "" # Renamed to avoid confusion with 'video' bytes variable
+        video_bytes_for_media_info = b""
+        file_len = 0
+
+        if isinstance(video, os.PathLike): # 优先处理路径
+            if not os.path.exists(video):
+                logger.error(f"[WechatAPIClient] Video path does not exist: {video}")
+                raise ValueError(f"Video path does not exist: {video}") # Or handle error appropriately
+            with open(video, "rb") as f_vid:
+                video_bytes_for_media_info = f_vid.read() # 只读取一次
+            vid_base64_str = base64.b64encode(video_bytes_for_media_info).decode()
+            file_len = len(video_bytes_for_media_info)
+            # MediaInfo.parse 可以接收路径或 BytesIO
+            media_info_source = video # 使用原始路径给 MediaInfo
+        elif isinstance(video, bytes):
+            video_bytes_for_media_info = video
+            vid_base64_str = base64.b64encode(video_bytes_for_media_info).decode()
+            file_len = len(video_bytes_for_media_info)
+            media_info_source = BytesIO(video_bytes_for_media_info) # 使用 BytesIO 给 MediaInfo
+        elif isinstance(video, str): # 假定是 Base64 字符串
+            vid_base64_str = video 
+            try:
+                video_bytes_for_media_info = base64.b64decode(vid_base64_str) # 解码以获取字节，用于MediaInfo和长度
+            except binascii.Error as e:
+                logger.error(f"[WechatAPIClient] Invalid Base64 string provided for video: {e}")
+                raise ValueError(f"Invalid Base64 string for video: {e}")
+            file_len = len(video_bytes_for_media_info)
+            media_info_source = BytesIO(video_bytes_for_media_info)
+        else:
+            raise ValueError("video should be str, bytes, or os.PathLike")
+
+        try:
+            media_info = MediaInfo.parse(media_info_source)
+            # 确保至少有一个轨道并且有时长属性
+            if media_info.tracks and hasattr(media_info.tracks[0], 'duration') and media_info.tracks[0].duration is not None :
+                duration = int(media_info.tracks[0].duration / 1000) # pymediainfo 的 duration 是毫秒
+            else:
+                logger.warning(f"[WechatAPIClient] Could not determine duration from MediaInfo for video. Defaulting to 0. Tracks: {len(media_info.tracks)}")
+                duration = 0 # 设置一个默认值或进行错误处理
+        except Exception as e_media_info:
+            logger.warning(f"[WechatAPIClient] Failed to parse MediaInfo for video. Defaulting duration to 0. Error: {e_media_info}")
+            duration = 0
+
+
+        predict_time = int(file_len / 1024 / 300) if file_len > 0 else 0
+        logger.info(f"开始发送视频: 对方wxid:{wxid} 预计耗时:{predict_time}秒, 时长:{duration}s, 文件大小:{file_len / 1024:.2f}KB")
 
         async with aiohttp.ClientSession() as session:
-            json_param = {"Wxid": self.wxid, "ToWxid": wxid, "Base64": vid_base64, "ImageBase64": image_base64,
-                          "PlayLength": duration}
-            async with session.post(f'http://{self.ip}:{self.port}/VXAPI/Msg/SendVideo', json=json_param) as resp:
-                json_resp = await resp.json()
+            json_param = {
+                "Wxid": self.wxid,
+                "ToWxid": wxid,
+                "Base64": vid_base64_str, # 使用纯Base64字符串
+                "PlayLength": duration
+            }
+            if image_base64 and processed_image: # Only add ImageBase64 if it was successfully processed (even if to default)
+                json_param["ImageBase64"] = image_base64
+            else:
+                logger.warning("[WechatAPIClient] image_base64 is empty or image processing failed BEFORE json_param construction. Thumbnail will not be sent.")
+            
+            # 确保API路径和ip/port是正确的
+            api_url = f'http://{self.ip}:{self.port}/VXAPI/Msg/SendVideo'
+            logger.debug(f"[WechatAPIClient] Posting to SendVideo API: {api_url}, ToWxid: {wxid}, PlayLength: {duration}")
+
+            async with session.post(api_url, json=json_param) as resp:
+                try:
+                    json_resp = await resp.json()
+                except aiohttp.ContentTypeError:
+                    text_resp = await resp.text()
+                    logger.error(f"[WechatAPIClient] SendVideo API did not return JSON. Status: {resp.status}, Response: {text_resp}")
+                    self.error_handler({"Success": False, "Code": resp.status, "Message": f"API non-JSON response: {text_resp}"}) # 调用错误处理器
+                    return None # 或者根据错误处理器的行为决定
 
         if json_resp.get("Success"):
-            json_param.pop('Base64')
-            json_param.pop('ImageBase64')
-            logger.info("发送视频成功: 对方wxid:{} 时长:{} 视频base64略 图片base64略", wxid, duration)
+            # json_param.pop('Base64', None) # 安全地移除
+            # json_param.pop('ImageBase64', None) # 安全地移除
+            logger.info(f"发送视频成功: 对方wxid:{wxid} 时长:{duration}")
             data = json_resp.get("Data")
-            return data.get("clientMsgId"), data.get("newMsgId")
+            if data: # 确保Data存在
+                return data.get("clientMsgId"), data.get("newMsgId")
+            else: # 如果Data不存在，也视为一种失败或不完整响应
+                logger.warning(f"[WechatAPIClient] SendVideo API Success, but no Data field in response: {json_resp}")
+                return None, None # 或者根据需求返回
         else:
-            self.error_handler(json_resp)
+            self.error_handler(json_resp) # error_handler 应该处理错误，可能抛异常
+            return None # 确保在错误时有返回值，除非error_handler总是抛异常
 
     async def send_voice_message(self, wxid: str, voice: Union[str, bytes, os.PathLike], format: str = "amr") -> \
             tuple[int, int, int]:

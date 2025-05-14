@@ -43,7 +43,12 @@ class WX849Message(ChatMessage):
         # 添加actual_user_id和actual_user_nickname字段，与sender_wxid保持一致
         self.actual_user_id = ""    # 实际发送者ID
         self.actual_user_nickname = "" # 实际发送者昵称
-        
+
+        # --- 在这里或附近添加以下两行 ---
+        self.is_processed_text_quote: bool = False
+        self.is_processed_image_quote: bool = False
+        # --- 添加结束 ---
+
         self._convert_msg_type_to_ctype()
         self.type = self.ctype  # Ensure self.type attribute exists and holds the ContextType value
         

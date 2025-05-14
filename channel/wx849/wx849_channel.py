@@ -1523,6 +1523,14 @@ class WX849Channel(ChatChannel):
                 logger.debug(f"[WX849] 群聊发送者提取(方法1): {cmsg.sender_wxid}")
             
             # 方法2: 尝试解析简单的格式 "wxid:消息内容"
+            #if not sender_extracted:
+            #    split_content = cmsg.content.split(":", 1)
+            #    if len(split_content) > 1 and split_content[0] and not split_content[0].startswith("<"):
+            #        cmsg.sender_wxid = split_content[0]
+            #        cmsg.content = split_content[1]
+            #        sender_extracted = True
+            #        logger.debug(f"[WX849] 群聊发送者提取(方法2): {cmsg.sender_wxid}")
+            
             # 方法3: 尝试从回复XML中提取
             if not sender_extracted and cmsg.content and cmsg.content.startswith("<"):
                 try:
@@ -1619,6 +1627,14 @@ class WX849Channel(ChatChannel):
                 logger.debug(f"[WX849] 群聊发送者提取(方法1): {cmsg.sender_wxid}")
             
             # 方法2: 尝试解析简单的格式 "wxid:消息内容"
+            #if not sender_extracted:
+            #    split_content = cmsg.content.split(":", 1)
+            #    if len(split_content) > 1 and split_content[0] and not split_content[0].startswith("<"):
+            #        cmsg.sender_wxid = split_content[0]
+            #        cmsg.content = split_content[1]
+            #        sender_extracted = True
+            #       logger.debug(f"[WX849] 群聊发送者提取(方法2): {cmsg.sender_wxid}")
+            
             # 方法3: 尝试从MsgSource XML中提取
             if not sender_extracted:
                 try:
@@ -1929,126 +1945,6 @@ class WX849Channel(ChatChannel):
             logger.warning(f"[{self.name}] Msg {cmsg.msg_id}: Image path not available after processing. Image download might have failed or was skipped.")
 
 
-    def _compress_image_data_if_needed(self, image_data: bytes, file_identifier_for_log: str) -> bytes:
-        import io
-        import math
-        # Ensure 'from PIL import Image, UnidentifiedImageError' is at the top of your file
-        # If not, the following line will try to import, but top-level is preferred.
-        try:
-            from PIL import Image, UnidentifiedImageError
-        except ImportError:
-            logger.error(f"[{self.name}] Pillow (PIL) library is not installed. Cannot compress image '{file_identifier_for_log}'. Please install it (`pip install Pillow`).")
-            return image_data
-
-        COMPRESSION_THRESHOLD_BYTES = 2 * 1024 * 1024  # 2MB
-        original_size_bytes = len(image_data)
-
-        if original_size_bytes == 0:
-            logger.warning(f"[{self.name}] Image '{file_identifier_for_log}' data is empty (0 bytes). Skipping compression.")
-            return image_data
-
-        if original_size_bytes <= COMPRESSION_THRESHOLD_BYTES:
-            logger.info(f"[{self.name}] Image '{file_identifier_for_log}' size ({original_size_bytes / (1024*1024):.2f}MB) <= 2MB. No compression.")
-            return image_data
-
-        logger.info(f"[{self.name}] Image '{file_identifier_for_log}' size ({original_size_bytes / (1024*1024):.2f}MB) > 2MB. Attempting compression.")
-        
-        try:
-            img_pil = Image.open(io.BytesIO(image_data))
-            # Preserve original format, default to JPEG if not identifiable
-            original_format = img_pil.format if img_pil.format else 'JPEG'
-            save_format = original_format.upper()
-
-            if save_format == 'GIF':
-                logger.info(f"[{self.name}] Image '{file_identifier_for_log}' is GIF. Skipping compression.")
-                return image_data
-            
-            # Handle transparency: If image has alpha and target format doesn't support it (like JPEG), convert to RGB.
-            if img_pil.mode in ('RGBA', 'LA') or (img_pil.mode == 'P' and 'transparency' in img_pil.info):
-                if save_format == 'JPEG' or (save_format not in ['PNG', 'WEBP']): # WEBP supports alpha
-                    logger.info(f"[{self.name}] Image '{file_identifier_for_log}' has alpha and target format is {save_format if save_format in ['JPEG', 'PNG', 'WEBP'] else 'JPEG'}. Converting to RGB.")
-                    img_pil = img_pil.convert('RGB')
-                    save_format = 'JPEG' # Force JPEG if was unknown and converted due to alpha
-            
-            if save_format not in ['JPEG', 'PNG', 'WEBP']:
-                logger.warning(f"[{self.name}] Image '{file_identifier_for_log}' has an unsupported format '{save_format}' for direct compression, attempting to save as JPEG.")
-                save_format = 'JPEG'
-                if img_pil.mode not in ('RGB', 'L'): # L is grayscale
-                    img_pil = img_pil.convert('RGB')
-
-            img_to_process = img_pil.copy()
-            processed_data = image_data # Fallback to original if all fails
-            current_size_after_initial_save = original_size_bytes
-
-            # Step 1: Initial save with moderate quality (for JPEG/WEBP) or standard optimization (PNG)
-            with io.BytesIO() as buffer:
-                if save_format == 'JPEG':
-                    img_to_process.save(buffer, format='JPEG', quality=75, optimize=True) # Start with quality 75
-                elif save_format == 'WEBP':
-                    img_to_process.save(buffer, format='WEBP', quality=75, lossless=False)
-                elif save_format == 'PNG':
-                    img_to_process.save(buffer, format='PNG', optimize=True)
-                else: # Should have been defaulted to JPEG
-                    img_to_process.save(buffer, format='JPEG', quality=75, optimize=True)
-                processed_data = buffer.getvalue()
-                current_size_after_initial_save = len(processed_data)
-            logger.info(f"[{self.name}] Image '{file_identifier_for_log}' (as {save_format}) initial save. Size: {current_size_after_initial_save/(1024*1024):.2f}MB.")
-
-            # Target "half original size"
-            desired_target_size_bytes = original_size_bytes * 0.55 # Aim for ~55% to give some leeway
-
-            if current_size_after_initial_save > desired_target_size_bytes:
-                logger.info(f"[{self.name}] Image '{file_identifier_for_log}' ({current_size_after_initial_save/(1024*1024):.2f}MB) still larger than ~55% target ({desired_target_size_bytes/(1024*1024):.2f}MB). Attempting resize.")
-                
-                current_width, current_height = img_to_process.size
-                
-                # Calculate resize_ratio based on the area (proportional to data size)
-                # Avoid division by zero if current_size_after_initial_save is 0
-                if current_size_after_initial_save == 0:
-                    logger.error(f"[{self.name}] Image data became zero bytes after initial save for '{file_identifier_for_log}'. Skipping resize, returning original data.")
-                    return image_data
-
-                resize_ratio_by_area = math.sqrt(desired_target_size_bytes / current_size_after_initial_save)
-                # Apply bounds to prevent extreme resizing or slight upscaling
-                resize_ratio = max(0.3, min(resize_ratio_by_area, 0.95)) # e.g. scale down to 30% dim, or at most 95% of current dim
-
-                new_width = int(current_width * resize_ratio)
-                new_height = int(current_height * resize_ratio)
-
-                if new_width < 100 or new_height < 100: # Don't make images ridiculously small
-                    logger.warning(f"[{self.name}] Image '{file_identifier_for_log}' resize target ({new_width}x{new_height}) is too small. Using image from initial compression if smaller, otherwise original.")
-                    return processed_data if len(processed_data) < original_size_bytes else image_data
-
-                logger.info(f"[{self.name}] Resizing '{file_identifier_for_log}' from {current_width}x{current_height} to {new_width}x{new_height}.")
-                img_resized = img_to_process.resize((new_width, new_height), Image.LANCZOS)
-                
-                with io.BytesIO() as buffer:
-                    final_save_quality = 70 # A good general quality after resizing
-                    if save_format == 'JPEG':
-                        img_resized.save(buffer, format='JPEG', quality=final_save_quality, optimize=True)
-                    elif save_format == 'PNG':
-                        img_resized.save(buffer, format='PNG', optimize=True)
-                    elif save_format == 'WEBP':
-                        img_resized.save(buffer, format='WEBP', quality=final_save_quality, lossless=False)
-                    processed_data = buffer.getvalue()
-                logger.info(f"[{self.name}] Image '{file_identifier_for_log}' (as {save_format}) after resize. Final size: {len(processed_data)/(1024*1024):.2f}MB.")
-            
-            # Final check: if somehow compression made it larger (e.g. for already highly optimized small PNGs)
-            if len(processed_data) >= original_size_bytes:
-                logger.warning(f"[{self.name}] Compression for '{file_identifier_for_log}' resulted in larger or same size ({len(processed_data)/(1024*1024):.2f}MB vs {original_size_bytes/(1024*1024):.2f}MB). Returning original.")
-                return image_data
-                
-            logger.info(f"[{self.name}] Image '{file_identifier_for_log}' compressed from {original_size_bytes/(1024*1024):.2f}MB to {len(processed_data)/(1024*1024):.2f}MB.")
-            return processed_data
-
-        except UnidentifiedImageError:
-            logger.error(f"[{self.name}] Pillow could not identify image format for '{file_identifier_for_log}'. Skipping compression.")
-            return image_data
-        except Exception as e:
-            logger.error(f"[{self.name}] Error during image compression for '{file_identifier_for_log}': {e}", exc_info=True)
-            return image_data # Return original on any other error
-
-
     async def _download_image(self, cmsg):
         """下载图片并设置本地路径"""
         try:
@@ -2207,54 +2103,93 @@ class WX849Channel(ChatChannel):
                                 logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API Error: Non-JSON response. Status: {response.status}. Response text (first 300 chars): {raw_response_text[:300]}")
                                 download_stream_successful = False; break
 
-                            # Enhanced chunk_base64 extraction (inspired by回忆版)
-                            chunk_base64 = None
-                            if result and isinstance(result, dict):
-                                if not result.get("Success", False): # Check API success flag first
-                                    logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API报告失败: {result.get('Message', '未知错误')}. FullResult: {str(result)[:300]}")
-                                    download_stream_successful = False; break
+                            # [MODIFIED START] Enhanced API Response Handling
+                            api_call_succeeded = False
+                            error_message_from_api = "Unknown API error"
 
-                                data_payload = result.get("Data", {})
-                                if isinstance(data_payload, dict):
-                                    if "buffer" in data_payload: chunk_base64 = data_payload["buffer"]
-                                    elif "data" in data_payload and isinstance(data_payload.get("data"), dict) and "buffer" in data_payload["data"]: chunk_base64 = data_payload["data"]["buffer"]
-                                    else:
-                                        for field in ["Chunk", "Image", "Data", "Base64Data", "fileData"]: # Common field names
-                                            if field in data_payload and data_payload.get(field): chunk_base64 = data_payload[field]; break
-                                elif isinstance(data_payload, str) and data_payload: # Data itself is base64 string
-                                    chunk_base64 = data_payload
-                                
-                                # Fallback to check root result if not found in Data payload
-                                if not chunk_base64:
-                                    for field in ["data", "Data", "fileData", "Image", "base64Data"]:
-                                         if field in result and result.get(field): chunk_base64 = result[field]; break
-                            else: # result is not a dict or is None
-                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API报告失败: 无效的响应格式. FullResult: {str(result)[:300]}")
+                            base_response = result.get("BaseResponse")
+                            if isinstance(base_response, dict):
+                                api_ret_code = base_response.get("ret")
+                                if api_ret_code == 0:
+                                    api_call_succeeded = True
+                                    # Even if ret is 0, check overall Success flag if API uses it
+                                    if not result.get("Success", True): # If Success key exists and is False
+                                        api_call_succeeded = False
+                                        error_message_from_api = result.get("Message", base_response.get("errMsg", "API Success=false after BaseResponse.ret=0"))
+                                elif api_ret_code is not None: # ret is present and non-zero
+                                    error_message_from_api = base_response.get("errMsg", f"API error with ret code {api_ret_code}")
+                                    logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API报告错误 (BaseResponse): ret={api_ret_code}, errMsg='{error_message_from_api}'. FullResult: {str(result)[:300]}")
+                                    download_stream_successful = False; break
+                                else: # BaseResponse exists but no 'ret' field, or 'ret' is None. Fallback to 'Success' flag.
+                                    if not result.get("Success", False): # Default to False if Success is missing or explicitly false
+                                        error_message_from_api = result.get("Message", "API Success flag is false and BaseResponse.ret is missing.")
+                                        logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API报告失败 (Success flag after missing BaseResponse.ret): {error_message_from_api}. FullResult: {str(result)[:300]}")
+                                        download_stream_successful = False; break
+                                    else: # BaseResponse without 'ret', but 'Success' is true or missing (implies true)
+                                        api_call_succeeded = True 
+                            else: # No BaseResponse dict, rely solely on "Success" flag
+                                if not result.get("Success", False): # Default to False if Success is missing or explicitly false
+                                    error_message_from_api = result.get("Message", "API Success flag is false and no BaseResponse.")
+                                    logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API报告失败 (Success flag, no BaseResponse): {error_message_from_api}. FullResult: {str(result)[:300]}")
+                                    download_stream_successful = False; break
+                                else: # No BaseResponse, Success is true or missing (implies true by default for this path)
+                                    api_call_succeeded = True
+
+                            if not api_call_succeeded: # This should ideally be caught by breaks above, but serves as a final safeguard.
+                                # Log if somehow this state is reached without a break.
+                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 最终判断为API调用失败. Message: {error_message_from_api}. FullResult: {str(result)[:300]}\")")
                                 download_stream_successful = False; break
                             
+                            # Proceed with chunk_base64 extraction only if api_call_succeeded
+                            chunk_base64 = None
+                            # Try to get data from a common "Data" wrapper first
+                            data_payload = result.get("Data") # Use .get() to avoid KeyError if "Data" is not present
+                            
+                            if isinstance(data_payload, dict) and data_payload: # Check if data_payload is a non-empty dict
+                                if "buffer" in data_payload and isinstance(data_payload["buffer"], (str, bytes)):
+                                    chunk_base64 = data_payload["buffer"]
+                                elif "data" in data_payload and isinstance(data_payload.get("data"), dict) and \
+                                     "buffer" in data_payload["data"] and isinstance(data_payload["data"]["buffer"], (str, bytes)):
+                                    chunk_base64 = data_payload["data"]["buffer"]
+                                else: # Check other common fields within data_payload dict
+                                    for field in ["Chunk", "Image", "Base64Data", "fileData"]:
+                                        potential_data_in_payload = data_payload.get(field)
+                                        if isinstance(potential_data_in_payload, (str, bytes)) and potential_data_in_payload:
+                                            chunk_base64 = potential_data_in_payload; break
+                            elif isinstance(data_payload, str) and data_payload: # "Data" field itself is a base64 string
+                                chunk_base64 = data_payload
+                            
+                            # Fallback: If not found in "Data" payload or "Data" was not a string, check root level fields
                             if not chunk_base64:
-                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 失败: 响应中未找到有效的图片数据。Response: {str(result)[:300]}")
-                                # If API returned success but no data for the first chunk of an unknown length download, it means no data.
-                                if data_len == 0 and i == 0 and result.get("Success", False):
+                                for field in ["data", "fileData", "Image", "base64Data", "buffer", "chunk"]: # Common root level fields
+                                    potential_data_at_root = result.get(field)
+                                    if isinstance(potential_data_at_root, (str, bytes)) and potential_data_at_root: # Must be string/bytes and not empty
+                                        chunk_base64 = potential_data_at_root; break
+                            
+                            if not chunk_base64:
+                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 成功获取API响应但未能提取到有效的图片数据字符串/字节. Response: {str(result)[:300]}")
+                                # If API reported success but no data for the first chunk of an unknown length download, it might be an empty image.
+                                if data_len == 0 and i == 0:
                                     logger.info(f"[{self.name}] API reported success but no data for first chunk (unknown length) for cmsg {cmsg.msg_id}. Assuming empty image or end of stream.")
-                                    # download_stream_successful remains True, but loop will break due to no chunk_base64 if num_chunks was > 1.
-                                    # If num_chunks was 1, all_chunks_data_list will be empty.
+                                    # download_stream_successful can remain true, let it try to finalize as empty.
                                 else:
-                                     download_stream_successful = False
+                                     download_stream_successful = False # Mark as failure if data was expected
                                 break 
+                            # [MODIFIED END]
                             
                             try:
                                 if isinstance(chunk_base64, bytes): # If API directly returns bytes
                                     chunk_data_bytes = chunk_base64
                                 elif isinstance(chunk_base64, str):
                                     clean_base64 = chunk_base64.strip()
-                                    # It's common for some APIs to return base64 without padding.
-                                    # Python's b64decode can sometimes handle missing padding, but explicit padding is safer.
                                     padding_needed = (4 - len(clean_base64) % 4) % 4
                                     clean_base64 += '=' * padding_needed
                                     chunk_data_bytes = base64.b64decode(clean_base64)
                                 else:
-                                    raise ValueError(f"chunk_base64 is neither str nor bytes: {type(chunk_base64)}")
+                                    # This path should not be reached if the extraction logic above correctly ensures chunk_base64 is str or bytes.
+                                    logger.error(f"[{self.name}] 逻辑错误: chunk_base64 在解码前既不是字符串也不是字节. Type: {type(chunk_base64)}. Value: {str(chunk_base64)[:100]}")
+                                    # This indicates a flaw in the success checking or data extraction logic if it reaches here with a dict.
+                                    download_stream_successful = False; break # Treat as critical logic failure.
 
                                 if not chunk_data_bytes and data_len == 0 and i == 0:
                                     logger.info(f"[{self.name}] API returned empty decoded data for chunk 1 (unknown length) for cmsg {cmsg.msg_id}. Download stream ended.")
@@ -2286,68 +2221,45 @@ class WX849Channel(ChatChannel):
                     logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 发生API调用错误: {api_err}\n{traceback.format_exc()}")
                     download_stream_successful = False; break
             
-            # 4. 数据写入、刷新与同步 (incorporating compression)
+            # 4. 数据写入、刷新与同步
             file_written_successfully = False
-            final_image_data_to_write = None 
-            # actual_downloaded_size is already correctly calculated from raw chunks sum
-
-            if download_stream_successful and all_chunks_data_list:
-                original_image_bytes = b"".join(all_chunks_data_list)
-                all_chunks_data_list = [] # Clear list to free memory as soon as possible
-
-                raw_downloaded_size_for_log = len(original_image_bytes) # For logging
-
-                if raw_downloaded_size_for_log == 0:
-                    logger.info(f"[{self.name}] Downloaded 0 bytes for cmsg {cmsg.msg_id}. Assuming empty image from API. Path: {image_path}")
-                    final_image_data_to_write = original_image_bytes # Keep it as empty bytes
-                else:
-                    # --- COMPRESSION STEP ---
-                    logger.info(f"[{self.name}] Raw downloaded {raw_downloaded_size_for_log/(1024*1024):.2f}MB for cmsg {cmsg.msg_id}. Processing for potential compression before writing to {image_path}.")
-                    final_image_data_to_write = self._compress_image_data_if_needed(original_image_bytes, image_path)
-                    # --- END COMPRESSION STEP ---
-                
-                del original_image_bytes # Free memory
-
-                if final_image_data_to_write is not None: # Check if data is not None (could be empty if original was empty)
-                    try:
-                        with open(image_path, "wb") as f_write:
-                            f_write.write(final_image_data_to_write)
-                        
+            if download_stream_successful and all_chunks_data_list: # Ensure there's data to write
+                try:
+                    # Write to the target image_path (e.g., CACHE_DIR/AESKEY.tmp)
+                    with open(image_path, "wb") as f_write:
+                        for chunk_piece in all_chunks_data_list:
+                            f_write.write(chunk_piece)
                         f_write.flush()
                         if hasattr(os, 'fsync'):
                             try: os.fsync(f_write.fileno())
-                            except OSError: pass # Ignore fsync errors on some systems
-                        
-                        final_size_on_disk = os.path.getsize(image_path)
-                        logger.info(f"[{self.name}] Image data written to disk: {image_path}. Final size on disk: {final_size_on_disk / (1024*1024):.2f}MB (Raw downloaded: {raw_downloaded_size_for_log / (1024*1024):.2f}MB)")
+                            except OSError: pass # Ignore fsync errors on some systems like Windows
+                    
+                    final_size_on_disk = os.path.getsize(image_path)
+                    logger.info(f"[{self.name}] 所有分块成功写入并刷新到磁盘: {image_path}, 实际大小: {final_size_on_disk} B (Downloaded: {actual_downloaded_size} B)")
+                    if final_size_on_disk == 0 and actual_downloaded_size > 0 :
+                        logger.error(f"[{self.name}] 警告：数据已下载 ({actual_downloaded_size}B) 但写入文件后大小为0！Path: {image_path}")
+                        # This is a critical error, file write failed despite no IO Exception.
+                        file_written_successfully = False
+                    elif final_size_on_disk == 0 and actual_downloaded_size == 0:
+                        logger.info(f"[{self.name}] 下载完成，但未收到任何数据且文件大小为0 (可能为空图片或API指示无内容): {image_path}")
+                        # This might be acceptable for an empty image. PIL check will confirm.
+                        file_written_successfully = True 
+                    else:
+                        file_written_successfully = True
 
-                        # An empty file (0 bytes) is considered successfully written if raw download was also 0 bytes.
-                        # If raw download was >0 bytes but disk file is 0, it's an error.
-                        if final_size_on_disk == 0 and raw_downloaded_size_for_log > 0 :
-                            logger.error(f"[{self.name}] CRITICAL ERROR: Raw data was {raw_downloaded_size_for_log/(1024*1024):.2f}MB but written file after compression/processing is 0 bytes! Path: {image_path}")
-                            file_written_successfully = False
-                        else: # Covers final_size_on_disk > 0 OR (final_size_on_disk == 0 AND raw_downloaded_size_for_log == 0)
-                            file_written_successfully = True
+                except IOError as io_err_write:
+                    logger.error(f"[{self.name}] 写入或刷新图片文件失败: {io_err_write}, Path: {image_path}")
+                except Exception as e_write:
+                    logger.error(f"[{self.name}] 写入文件时发生未知错误: {e_write}, Path: {image_path}\n{traceback.format_exc()}")
 
-                    except IOError as io_err_write:
-                        logger.error(f"[{self.name}] Failed to write image file (after potential compression): {io_err_write}, Path: {image_path}")
-                        file_written_successfully = False # Ensure it's marked
-                    except Exception as e_write:
-                        logger.error(f"[{self.name}] Unknown error during file write (after potential compression): {e_write}, Path: {image_path}\n{traceback.format_exc()}")
-                        file_written_successfully = False # Ensure it's marked
-                else: # final_image_data_to_write is None (should not happen if logic is correct, means compression returned None unexpectedly)
-                    logger.error(f"[{self.name}] Image data is None after compression attempt for {image_path}. Raw downloaded: {raw_downloaded_size_for_log/(1024*1024):.2f}MB. Not writing file.")
-                    file_written_successfully = False
-            
-            elif not all_chunks_data_list and download_stream_successful: # No data collected from API
-                logger.warning(f"[{self.name}] All chunk download API calls successful, but no data blocks were collected for {image_path}. File will be empty or not created.")
-                # If image_path was touched (e.g. to create an empty file)
+            elif not all_chunks_data_list and download_stream_successful:
+                logger.warning(f"[{self.name}] 所有分块下载API调用成功，但未收集到任何数据块 for {image_path}. 文件将为空或不存在。")
+                # Consider this a failure unless an empty image is valid.
                 if os.path.exists(image_path) and os.path.getsize(image_path) == 0:
-                    file_written_successfully = True # Successfully "wrote" an empty file.
-                    logger.info(f"[{self.name}] An empty file {image_path} exists as no data was collected.")
-                else: # No data and no empty file explicitly created from this flow
-                    download_stream_successful = False # Mark as overall failure for subsequent checks if no file means failure
-                    file_written_successfully = False
+                    file_written_successfully = True # Empty file was "successfully" written.
+                else: # No file or data
+                    download_stream_successful = False # Mark as failure for subsequent checks
+
 
             # 5. 图片验证阶段 和 重命名 (if image_path was .tmp)
             final_verified_path = None
@@ -4923,6 +4835,7 @@ class WX849Channel(ChatChannel):
             except Exception as plugin_e:
                 logger.error(f"[WX849] Error during ON_RECEIVE_MESSAGE event processing: {plugin_e}", exc_info=True)
                 # 根据需要决定是否继续，这里选择继续返回原始 context
+            # --- 结束插入修改 ---
 
             return context # 返回（可能被插件修改过的）context
         except Exception as e:

@@ -302,6 +302,75 @@ class WX849Channel(ChatChannel):
         self.is_running = False
         self.is_logged_in = False
         self.group_name_cache = {}
+        self.image_cache_dir = os.path.join(os.getcwd(), "tmp", "wx849_img_cache")
+        try:
+            if not os.path.exists(self.image_cache_dir):
+                os.makedirs(self.image_cache_dir, exist_ok=True)
+                logger.info(f"[{self.name}] Created image cache directory: {self.image_cache_dir}")
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to create image cache directory {self.image_cache_dir}: {e}")
+
+    def _cleanup_cached_images(self):
+        """Cleans up expired image files from the cache directory."""
+        if not hasattr(self, 'image_cache_dir') or not self.image_cache_dir:
+            logger.warning(f"[{self.name}] Image cache directory not configured. Skipping cleanup.")
+            return
+        
+        logger.info(f"[{self.name}] Starting image cache cleanup in {self.image_cache_dir}...")
+        try:
+            current_time = time.time()
+            max_age_seconds = 7 * 24 * 60 * 60  # Cache images for 7 days
+
+            # Iterate over common image extensions used for caching
+            # Ensure this matches extensions used during caching (see phase A3)
+            for ext_pattern in ['*.jpg', '*.jpeg', '*.png', '*.gif']: 
+                pattern = os.path.join(self.image_cache_dir, ext_pattern)
+                cleaned_count = 0
+                total_size_cleaned = 0
+
+                for fpath in glob.glob(pattern):
+                    try:
+                        if os.path.isfile(fpath): # Ensure it's a file
+                            mtime = os.path.getmtime(fpath)
+                            if current_time - mtime > max_age_seconds:
+                                file_size = os.path.getsize(fpath)
+                                os.remove(fpath)
+                                cleaned_count += 1
+                                total_size_cleaned += file_size
+                                logger.debug(f"[{self.name}] Cleaned up expired cached image: {fpath} (Age: {(current_time - mtime)/3600/24:.1f} days)")
+                    except Exception as e:
+                        logger.warning(f"[{self.name}] Failed to process/delete cached image {fpath}: {e}")
+                
+                if cleaned_count > 0:
+                    logger.info(f"[{self.name}] Cleaned up {cleaned_count} '{ext_pattern}' images, freed {total_size_cleaned/1024/1024:.2f} MB.")
+            logger.info(f"[{self.name}] Image cache cleanup finished.")
+        except Exception as e:
+            logger.error(f"[{self.name}] Image cache cleanup task encountered an error: {e}")
+
+    def _start_image_cache_cleanup_task(self):
+        """Starts the periodic image cache cleanup task."""
+        if not hasattr(self, 'image_cache_dir'): # Don't start if cache isn't configured
+            return
+
+        def _cleanup_loop():
+            logger.info(f"[{self.name}] Image cache cleanup thread started.")
+            # Initial delay before first cleanup, e.g., 5 minutes after startup
+            time.sleep(5 * 60) 
+            while True:
+                try:
+                    self._cleanup_cached_images()
+                    # Sleep for a longer interval, e.g., 6 hours or 24 hours
+                    cleanup_interval_hours = 24 
+                    logger.debug(f"[{self.name}] Image cache cleanup task sleeping for {cleanup_interval_hours} hours.")
+                    time.sleep(cleanup_interval_hours * 60 * 60)
+                except Exception as e:
+                    logger.error(f"[{self.name}] Image cache cleanup loop error: {e}. Retrying in 1 hour.")
+                    time.sleep(60 * 60) # Wait an hour before retrying the loop on major error
+
+        cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
+        cleanup_thread.name = "WX849ImageCacheCleanupThread"
+        cleanup_thread.start()
+        logger.info(f"[{self.name}] Image cache cleanup task scheduled.")
 
     async def _initialize_bot(self):
         """初始化 bot"""
@@ -998,7 +1067,8 @@ class WX849Channel(ChatChannel):
         
         # 创建事件循环
         loop = asyncio.new_event_loop()
-        
+        self.loop = loop
+        self._start_image_cache_cleanup_task()         
         # 定义启动任务
         async def startup_task():
             # 初始化机器人（登录）
@@ -1233,9 +1303,9 @@ class WX849Channel(ChatChannel):
                 if hasattr(cmsg, 'is_processed_text_quote') and cmsg.is_processed_text_quote:
                     # 确保 re 模块在这里是可用的
                     import re # <--- 在这里显式导入一次
-                    match = re.match(r'(用户针对以下(?:消息|聊天记录)提问：“)(.*?)(”\n\n)', cmsg.content, re.DOTALL)
+                    match = re.match(r'(用户针对以下(?:消息|聊天记录)提问：")(.*?)("\n\n)', cmsg.content, re.DOTALL)
                     if match:
-                        guide_prefix = match.group(1)  # "用户针对以下消息提问：“"
+                        guide_prefix = match.group(1)  # "用户针对以下消息提问：""
                         original_user_question_in_quote = match.group(2) # "xy他说什么"
                         guide_suffix = match.group(3)    # "”\n\n"
                         text_to_check_for_prefix = original_user_question_in_quote
@@ -1678,15 +1748,15 @@ class WX849Channel(ChatChannel):
         # 输出日志
         logger.info(f"收到文本消息: ID:{cmsg.msg_id} 来自:{cmsg.from_user_id} 发送人:{cmsg.sender_wxid} @:{cmsg.at_list} 内容:{cmsg.content}")
 
-    async def _process_image_message(self, cmsg):
+    async def _process_image_message(self, cmsg: WX849Message): # Added WX849Message type hint
         """处理图片消息"""
         import xml.etree.ElementTree as ET
         import os
-        import base64
-        import asyncio
-        import aiohttp
+
         import time
-        import threading
+        # import threading # Not used directly in this snippet
+        import traceback # Added for logging
+        from bridge.context import ContextType # Added for ContextType
 
         # 在这里不检查和标记图片消息，而是在图片下载完成后再标记
         # 这样可以确保图片消息被正确处理为IMAGE类型，而不是UNKNOWN类型
@@ -1694,25 +1764,35 @@ class WX849Channel(ChatChannel):
         cmsg.ctype = ContextType.IMAGE
 
         # 处理群聊/私聊消息发送者
-        if cmsg.is_group or cmsg.from_user_id.endswith("@chatroom"):
-            cmsg.is_group = True
-            split_content = cmsg.content.split(":\n", 1)
-            if len(split_content) > 1:
-                cmsg.sender_wxid = split_content[0]
-                cmsg.content = split_content[1]
-            else:
-                # 处理没有换行的情况
-                split_content = cmsg.content.split(":", 1)
+        if cmsg.is_group or (hasattr(cmsg, 'from_user_id') and cmsg.from_user_id and cmsg.from_user_id.endswith("@chatroom")):
+            cmsg.is_group = True # Ensure is_group is set
+            # Ensure cmsg.content is a string before splitting
+            if isinstance(cmsg.content, str):
+                split_content = cmsg.content.split(":\n", 1)
                 if len(split_content) > 1:
                     cmsg.sender_wxid = split_content[0]
-                    cmsg.content = split_content[1]
+                    cmsg.content = split_content[1] # This will be the XML part
                 else:
-                    cmsg.content = split_content[0]
-                    cmsg.sender_wxid = ""
+                    # 处理没有换行的情况 (less likely for image XML, but good to have)
+                    split_content_alt = cmsg.content.split(":", 1)
+                    if len(split_content_alt) > 1:
+                        # This case might be problematic if XML itself contains ':' early
+                        # For images, content is usually just the XML
+                        # Assuming if split by ':\n' fails, the content is the XML itself
+                        if not hasattr(cmsg, 'sender_wxid') or not cmsg.sender_wxid:
+                             cmsg.sender_wxid = cmsg.actual_user_id if hasattr(cmsg, 'actual_user_id') else ""
+                        # cmsg.content remains as is if no ":\n"
+                    else:
+                        cmsg.sender_wxid = cmsg.actual_user_id if hasattr(cmsg, 'actual_user_id') else ""
+            else: # cmsg.content is not a string (e.g. already bytes)
+                 cmsg.sender_wxid = cmsg.actual_user_id if hasattr(cmsg, 'actual_user_id') else ""
 
-            # 设置actual_user_id和actual_user_nickname
-            cmsg.actual_user_id = cmsg.sender_wxid
-            cmsg.actual_user_nickname = cmsg.sender_wxid
+
+            # 设置actual_user_id和actual_user_nickname (should be done by the calling _process_message)
+            if not hasattr(cmsg, 'actual_user_id') or not cmsg.actual_user_id:
+                cmsg.actual_user_id = cmsg.sender_wxid
+            if not hasattr(cmsg, 'actual_user_nickname') or not cmsg.actual_user_nickname:
+                cmsg.actual_user_nickname = cmsg.sender_wxid # Placeholder if no real nickname available
         else:
             # 私聊消息
             cmsg.sender_wxid = cmsg.from_user_id
@@ -1720,191 +1800,150 @@ class WX849Channel(ChatChannel):
 
             # 私聊消息也设置actual_user_id和actual_user_nickname
             cmsg.actual_user_id = cmsg.from_user_id
-            cmsg.actual_user_nickname = cmsg.from_user_id
+            cmsg.actual_user_nickname = cmsg.from_user_id # Placeholder
 
         # 解析图片信息
         try:
-            # 检查内容是否是XML
-            if cmsg.content and (cmsg.content.startswith('<?xml') or cmsg.content.startswith("<msg>")):
+            xml_content_to_parse = ""
+            if isinstance(cmsg.content, str) and (cmsg.content.startswith('<?xml') or cmsg.content.startswith("<msg>")):
+                xml_content_to_parse = cmsg.content
+            # Add handling if cmsg.content might be bytes that need decoding
+            elif isinstance(cmsg.content, bytes):
                 try:
-                    root = ET.fromstring(cmsg.content)
+                    xml_content_to_parse = cmsg.content.decode('utf-8')
+                    if not (xml_content_to_parse.startswith('<?xml') or xml_content_to_parse.startswith("<msg>")):
+                        xml_content_to_parse = "" # Not valid XML
+                except UnicodeDecodeError:
+                    logger.warning(f"[{self.name}] Msg {cmsg.msg_id}: Image content is bytes but failed to decode as UTF-8.")
+                    xml_content_to_parse = ""
+
+            if xml_content_to_parse:
+                try:
+                    root = ET.fromstring(xml_content_to_parse)
                     img_element = root.find('img')
                     if img_element is not None:
+                        # MODIFICATION START: Store aeskey and other info on cmsg directly
+                        cmsg.img_aeskey = img_element.get('aeskey')
+                        cmsg.img_cdnthumbaeskey = img_element.get('cdnthumbaeskey') # Optional
+                        cmsg.img_md5 = img_element.get('md5') # Optional
+                        cmsg.img_length = img_element.get('length', '0')
+                        cmsg.img_cdnmidimgurl = img_element.get('cdnmidimgurl', '')
+                        # MODIFICATION END
+
+                        # Use a combined dictionary for logging for clarity
                         cmsg.image_info = {
-                            'aeskey': img_element.get('aeskey', ''),
-                            'cdnmidimgurl': img_element.get('cdnmidimgurl', ''),
-                            'length': img_element.get('length', '0'),
-                            'md5': img_element.get('md5', '')
+                            'aeskey': cmsg.img_aeskey,
+                            'cdnmidimgurl': cmsg.img_cdnmidimgurl,
+                            'length': cmsg.img_length,
+                            'md5': cmsg.img_md5
                         }
-                        logger.debug(f"解析图片XML成功: aeskey={cmsg.image_info.get('aeskey', '')}, length={cmsg.image_info.get('length', '0')}, md5={cmsg.image_info.get('md5', '')}")
+                        logger.debug(f"[{self.name}] Msg {cmsg.msg_id}: Parsed image XML: aeskey={cmsg.img_aeskey}, length={cmsg.img_length}, md5={cmsg.img_md5}")
+                        
+                        if not cmsg.img_aeskey:
+                             logger.warning(f"[{self.name}] Msg {cmsg.msg_id}: Image XML 'aeskey' is missing. Caching by aeskey will not be possible.")
                     else:
-                        # 如果找不到img元素，创建一个默认的image_info
-                        cmsg.image_info = {
-                            'aeskey': '',
-                            'cdnmidimgurl': '',
-                            'length': '0',
-                            'md5': ''
-                        }
-                        logger.warning(f"[WX849] XML中未找到img元素，使用默认图片信息")
+                        logger.warning(f"[{self.name}] Msg {cmsg.msg_id}: XML in content but no <img> tag found. Content (first 100): {xml_content_to_parse[:100]}")
+                        # Initialize attributes on cmsg to prevent AttributeError later
+                        cmsg.img_aeskey = None
+                        cmsg.img_length = '0'
+                        # Create a default image_info for compatibility if other parts expect it
+                        cmsg.image_info = {'aeskey': '', 'cdnmidimgurl': '', 'length': '0', 'md5': ''}
                 except ET.ParseError as xml_err:
-                    # XML解析失败，创建一个默认的image_info
-                    logger.warning(f"[WX849] XML解析失败: {xml_err}, 使用默认图片信息")
-                    cmsg.image_info = {
-                        'aeskey': '',
-                        'cdnmidimgurl': '',
-                        'length': '0',
-                        'md5': ''
-                    }
+                    logger.warning(f"[{self.name}] Msg {cmsg.msg_id}: Failed to parse image XML: {xml_err}. Content (first 100): {xml_content_to_parse[:100]}")
+                    cmsg.img_aeskey = None
+                    cmsg.img_length = '0'
+                    cmsg.image_info = {'aeskey': '', 'cdnmidimgurl': '', 'length': '0', 'md5': ''}
+            else:
+                # Content is not XML (could be a path if already processed by another layer, or unexpected format)
+                logger.warning(f"[{self.name}] Msg {cmsg.msg_id}: Image content is not XML. Content (first 100): {str(cmsg.content)[:100]}")
+                cmsg.img_aeskey = None # Ensure it's defined
+                cmsg.img_length = '0'
+                cmsg.image_info = {'aeskey': '', 'cdnmidimgurl': '', 'length': '0', 'md5': ''} # Default
 
-                # 检查是否已经有图片路径
-                if hasattr(cmsg, 'image_path') and cmsg.image_path and os.path.exists(cmsg.image_path):
-                    logger.info(f"[WX849] 图片已存在，路径: {cmsg.image_path}")
-                else:
-                    # 创建一个锁文件，防止重复下载
-                    tmp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp", "images")
-                    os.makedirs(tmp_dir, exist_ok=True)
-                    lock_file = os.path.join(tmp_dir, f"img_{cmsg.msg_id}.lock")
+            # Download logic (largely from your snippet)
+            # Check if image_path is already set and valid
+            if hasattr(cmsg, 'image_path') and cmsg.image_path and os.path.exists(cmsg.image_path):
+                logger.info(f"[{self.name}] Msg {cmsg.msg_id}: Image already exists at path: {cmsg.image_path}")
+            else:
 
-                    # 检查锁文件是否存在
-                    if os.path.exists(lock_file):
-                        logger.info(f"[WX849] 图片 {cmsg.msg_id} 正在被其他线程下载，跳过")
-                        return
+                locks_tmp_dir = os.path.join(os.path.dirname(self.image_cache_dir) if hasattr(self, 'image_cache_dir') else os.path.join(os.getcwd(), "tmp"), "img_locks")
 
-                    # 创建锁文件
+                try:
+                    os.makedirs(locks_tmp_dir, exist_ok=True)
+                except Exception as e_mkdir:
+                     logger.error(f"[{self.name}] Failed to create lock directory {locks_tmp_dir}: {e_mkdir}")
+                     # Potentially skip download if lock dir cannot be made, or try without lock
+
+                lock_file = os.path.join(locks_tmp_dir, f"img_{cmsg.msg_id}.lock")
+
+                if os.path.exists(lock_file):
+                    # Check lock file age, could be stale
                     try:
-                        with open(lock_file, "w") as f:
-                            f.write(str(time.time()))
-                    except Exception as e:
-                        logger.error(f"[WX849] 创建锁文件失败: {e}")
-
-                    # 尝试下载图片
-                    try:
-                        # Asynchronously download the image
-                        result = await self._download_image(cmsg)
-                    except Exception as e:
-                        logger.error(f"[WX849] 下载图片失败: {e}")
-                        logger.error(traceback.format_exc())
-                    finally:
-                        # 删除锁文件
+                        lock_time = os.path.getmtime(lock_file)
+                        if (time.time() - lock_time) < 300: # 5-minute timeout for stale lock
+                            logger.info(f"[{self.name}] Image {cmsg.msg_id} is likely being downloaded by another thread (lock active). Skipping.")
+                            return # Skip if lock is recent
+                        else:
+                            logger.warning(f"[{self.name}] Image {cmsg.msg_id} lock file is stale. Removing and attempting download.")
+                            os.remove(lock_file)
+                    except Exception as e_lock_check:
+                        logger.warning(f"[{self.name}] Error checking stale lock for {cmsg.msg_id}: {e_lock_check}. Proceeding with caution.")
+                
+                download_attempted = False
+                try:
+                    # Create lock file
+                    with open(lock_file, "w") as f:
+                        f.write(str(time.time()))
+                    
+                    download_attempted = True
+                    logger.info(f"[{self.name}] Msg {cmsg.msg_id}: Attempting to download image.")
+                    # Asynchronously download the image
+                    # _download_image should set cmsg.image_path upon success
+                    await self._download_image(cmsg) 
+                    
+                except Exception as e:
+                    logger.error(f"[{self.name}] Msg {cmsg.msg_id}: Failed to download image: {e}")
+                    logger.error(traceback.format_exc())
+                finally:
+                    if download_attempted: # Only remove lock if we attempted to create it
                         try:
                             if os.path.exists(lock_file):
                                 os.remove(lock_file)
                         except Exception as e:
-                            logger.error(f"[WX849] 删除锁文件失败: {e}")
-            else:
-                # 如果内容不是XML，可能是已经下载好的图片路径
-                if os.path.exists(cmsg.content):
-                    cmsg.image_path = cmsg.content
-                    logger.info(f"[WX849] 图片已存在，路径: {cmsg.image_path}")
-                else:
-                    logger.warning(f"[WX849] 图片内容既不是XML也不是有效路径: {cmsg.content[:100]}")
-                    # 即使内容不是XML也不是有效路径，也创建一个默认的image_info
-                    cmsg.image_info = {
-                        'aeskey': '',
-                        'cdnmidimgurl': '',
-                        'length': '0',
-                        'md5': ''
-                    }
-                    # 检查是否已经有图片路径
-                    if hasattr(cmsg, 'image_path') and cmsg.image_path and os.path.exists(cmsg.image_path):
-                        logger.info(f"[WX849] 图片已存在，路径: {cmsg.image_path}")
-                    else:
-                        # 创建一个锁文件，防止重复下载
-                        tmp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp", "images")
-                        os.makedirs(tmp_dir, exist_ok=True)
-                        lock_file = os.path.join(tmp_dir, f"img_{cmsg.msg_id}.lock")
+                            logger.error(f"[{self.name}] Msg {cmsg.msg_id}: Failed to remove lock file {lock_file}: {e}")
+        
+        except Exception as e_outer: # Catch errors in the outer XML parsing/setup
+            logger.error(f"[{self.name}] Msg {cmsg.msg_id}: Major error in _process_image_message: {e_outer}")
+            logger.error(traceback.format_exc())
+            # Ensure default attributes if parsing failed badly
+            if not hasattr(cmsg, 'img_aeskey'): cmsg.img_aeskey = None
+            if not hasattr(cmsg, 'image_info'):
+                cmsg.image_info = {'aeskey': '', 'cdnmidimgurl': '', 'length': '0', 'md5': ''}
 
-                        # 检查锁文件是否存在
-                        if os.path.exists(lock_file):
-                            logger.info(f"[WX849] 图片 {cmsg.msg_id} 正在被其他线程下载，跳过")
-                            return
 
-                        # 创建锁文件
-                        try:
-                            with open(lock_file, "w") as f:
-                                f.write(str(time.time()))
-                        except Exception as e:
-                            logger.error(f"[WX849] 创建锁文件失败: {e}")
+        # This logging and recent_image_msgs update should happen regardless of download success
+        # as the message itself was an image message.
+        logger.info(f"[{self.name}] Processed image message (ID:{cmsg.msg_id} From:{cmsg.from_user_id} Sender:{cmsg.sender_wxid})")
 
-                        # 尝试下载图片
-                        try:
-                            # Asynchronously download the image
-                            result = await self._download_image(cmsg)
-                        except Exception as e:
-                            logger.error(f"[WX849] 下载图片失败: {e}")
-                            logger.error(traceback.format_exc())
-                        finally:
-                            # 删除锁文件
-                            try:
-                                if os.path.exists(lock_file):
-                                    os.remove(lock_file)
-                            except Exception as e:
-                                logger.error(f"[WX849] 删除锁文件失败: {e}")
-        except Exception as e:
-            logger.debug(f"解析图片消息失败: {e}, 内容: {cmsg.content[:100]}")
-            logger.debug(f"详细错误: {traceback.format_exc()}")
-            # 创建一个默认的image_info
-            cmsg.image_info = {
-                'aeskey': '',
-                'cdnmidimgurl': '',
-                'length': '0',
-                'md5': ''
-            }
-            # 检查是否已经有图片路径
-            if hasattr(cmsg, 'image_path') and cmsg.image_path and os.path.exists(cmsg.image_path):
-                logger.info(f"[WX849] 图片已存在，路径: {cmsg.image_path}")
-            else:
-                # 创建一个锁文件，防止重复下载
-                tmp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp", "images")
-                os.makedirs(tmp_dir, exist_ok=True)
-                lock_file = os.path.join(tmp_dir, f"img_{cmsg.msg_id}.lock")
+        # Record recently received image messages
+        # Ensure actual_user_id is set for session_id
+        session_user_id = cmsg.actual_user_id if hasattr(cmsg, 'actual_user_id') and cmsg.actual_user_id else cmsg.from_user_id
 
-                # 检查锁文件是否存在
-                if os.path.exists(lock_file):
-                    logger.info(f"[WX849] 图片 {cmsg.msg_id} 正在被其他线程下载，跳过")
-                    return
+        # Use self.received_msgs or a dedicated dict for image contexts for plugins
+        # self.recent_image_msgs was initialized in __init__
+        if hasattr(self, 'recent_image_msgs') and session_user_id:
+            self.recent_image_msgs[session_user_id] = cmsg # Store the WX849Message object
+            logger.info(f"[{self.name}] Recorded image message context for session {session_user_id} (MsgID: {cmsg.msg_id}).")
 
-                # 创建锁文件
-                try:
-                    with open(lock_file, "w") as f:
-                        f.write(str(time.time()))
-                except Exception as e:
-                    logger.error(f"[WX849] 创建锁文件失败: {e}")
 
-                # 尝试下载图片
-                try:
-                    # Asynchronously download the image
-                    result = await self._download_image(cmsg)
-                except Exception as e:
-                    logger.error(f"[WX849] 下载图片失败: {e}")
-                    logger.error(traceback.format_exc())
-                finally:
-                    # 删除锁文件
-                    try:
-                        if os.path.exists(lock_file):
-                            os.remove(lock_file)
-                    except Exception as e:
-                        logger.error(f"[WX849] 删除锁文件失败: {e}")
-
-        # 输出日志 - 修改为显示完整XML内容
-        logger.info(f"收到图片消息: ID:{cmsg.msg_id} 来自:{cmsg.from_user_id} 发送人:{cmsg.sender_wxid}")
-
-        # 记录最近收到的图片消息，用于识图等功能的关联
-        session_id = cmsg.from_user_id if cmsg.is_group else cmsg.sender_wxid
-        self.recent_image_msgs[session_id] = cmsg
-        logger.info(f"[WX849] 已记录会话 {session_id} 的图片消息，可用于识图关联")
-
-        # 如果已经有图片路径，更新消息内容为图片路径
+        # Final check and update of cmsg properties if image was successfully downloaded and path is set
         if hasattr(cmsg, 'image_path') and cmsg.image_path and os.path.exists(cmsg.image_path):
-            # 更新消息内容为图片路径
-            cmsg.content = cmsg.image_path
-            # 确保消息类型为IMAGE
-            cmsg.ctype = ContextType.IMAGE
-            # 图片已下载完成，记录日志
-            logger.info(f"[WX849] 图片下载完成，保存到: {cmsg.image_path}")
+            cmsg.content = cmsg.image_path # Update content to be the path
+            cmsg.ctype = ContextType.IMAGE # Ensure ctype is IMAGE
+            logger.info(f"[{self.name}] Msg {cmsg.msg_id}: Final image path set to: {cmsg.image_path}")
+        else:
+            logger.warning(f"[{self.name}] Msg {cmsg.msg_id}: Image path not available after processing. Image download might have failed or was skipped.")
 
-            # 不再在这里生成上下文并发送到DOW框架
-            # 图片消息只在_process_single_message_independently方法中处理一次
 
     async def _download_image(self, cmsg):
         """下载图片并设置本地路径"""
@@ -1915,7 +1954,7 @@ class WX849Channel(ChatChannel):
                 return True
 
             # 创建临时目录
-            tmp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp", "images")
+            tmp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp", "wx849_img_cache")
             os.makedirs(tmp_dir, exist_ok=True)
 
             # 检查是否已经存在相同的图片文件
@@ -1974,701 +2013,601 @@ class WX849Channel(ChatChannel):
             logger.error(traceback.format_exc())
             return False
 
-    async def _download_image_by_chunks(self, cmsg, image_path):
-        """使用分段下载方法获取图片"""
+    async def _download_image_by_chunks(self, cmsg: WX849Message, image_path: str): # Added type hints
+        """使用分段下载方法获取图片, 并在成功后缓存."""
+        import traceback
+        import asyncio
+        from io import BytesIO
+        from PIL import Image, UnidentifiedImageError
+        import shutil # MODIFICATION: Added import for shutil
+        import os # Ensure os is imported (likely already is)
+        from bridge.context import ContextType # Ensure ContextType is imported
+
+        try:
+            # 1. 确保目标目录存在
+            target_dir = os.path.dirname(image_path)
+            os.makedirs(target_dir, exist_ok=True) # target_dir is self.image_cache_dir
+
+            # 2. 获取API配置及计算分块信息
+            api_host = conf().get("wx849_api_host", "127.0.0.1")
+            api_port = conf().get("wx849_api_port", 9011) # Assuming 9011 is the media port
+            protocol_version = conf().get("wx849_protocol_version", "849")
+            api_path_prefix = "/api" if protocol_version in ["855", "ipad"] else "/VXAPI"
+            
+            data_len_str = '0'
+            if hasattr(cmsg, 'image_info') and isinstance(cmsg.image_info, dict):
+                data_len_str = cmsg.image_info.get('length', '0')
+            elif hasattr(cmsg, 'img_length'):
+                data_len_str = cmsg.img_length
+            
+            try:
+                data_len = int(data_len_str)
+            except ValueError:
+                data_len = 0
+            
+            if data_len <= 0:
+                 logger.warning(f"[{self.name}] Image length is {data_len} from XML for cmsg {cmsg.msg_id}. Download will proceed; actual size determined by API.")
+
+            chunk_size = 65536
+            num_chunks = (data_len + chunk_size - 1) // chunk_size if data_len > 0 else 1
+
+            logger.info(f"[{self.name}] 开始分段下载图片 (cmsg_id: {cmsg.msg_id}, aeskey: {getattr(cmsg, 'img_aeskey', 'N/A')}) 至: {image_path}，预期总大小: {data_len if data_len > 0 else 'Unknown'} B，分 {num_chunks} 段 (approx)")
+
+            # 3. 分块下载逻辑
+            all_chunks_data_list = []
+            download_stream_successful = True
+            actual_downloaded_size = 0
+
+            for i in range(num_chunks):
+                start_pos = actual_downloaded_size # Use actual_downloaded_size for start_pos
+                current_chunk_size = chunk_size # Request a full chunk
+
+                # For the last chunk with known data_len, adjust current_chunk_size if needed.
+                if data_len > 0 and (start_pos + chunk_size > data_len):
+                    current_chunk_size = data_len - start_pos
+                
+                if data_len > 0 and current_chunk_size <= 0 and start_pos >= data_len:
+                    logger.info(f"[{self.name}] Presumed all data downloaded for cmsg {cmsg.msg_id}. Total downloaded: {start_pos}, Expected: {data_len}. Breaking chunk loop.")
+                    break
+                if current_chunk_size <= 0 and data_len > 0: # Should not happen if logic above is correct
+                    logger.warning(f"[{self.name}] Calculated current_chunk_size as {current_chunk_size} for cmsg {cmsg.msg_id}, but data still expected. Breaking.")
+                    download_stream_successful = False; break
+
+
+                params = {
+                    "MsgId": int(cmsg.msg_id),
+                    "ToWxid": cmsg.from_user_id, # Sender of the original message
+                    "Wxid": self.wxid, # Bot's WXID
+                    "DataLen": data_len if data_len > 0 else 0, 
+                    "CompressType": 0,
+                    "Section": {"StartPos": start_pos, "DataLen": current_chunk_size}
+                }
+                if hasattr(cmsg, 'img_aeskey') and cmsg.img_aeskey:
+                    params["Aeskey"] = cmsg.img_aeskey
+
+                api_url = f"http://{api_host}:{api_port}{api_path_prefix}/Tools/DownloadImg"
+                logger.debug(f"[{self.name}] 下载分段 {i+1}/{num_chunks} for cmsg {cmsg.msg_id}: URL={api_url}, Params={params}")
+
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(api_url, json=params, timeout=aiohttp.ClientTimeout(total=30)) as response: # Increased timeout
+                            if response.status != 200:
+                                full_error_text = await response.text()
+                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 失败, HTTP状态码: {response.status}, Response: {full_error_text[:300]}")
+                                download_stream_successful = False; break
+                            
+                            try:
+                                result = await response.json()
+                            except aiohttp.ContentTypeError:
+                                raw_response_text = await response.text()
+                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API Error: Non-JSON response. Status: {response.status}. Response text (first 300 chars): {raw_response_text[:300]}")
+                                download_stream_successful = False; break
+
+                            # Enhanced chunk_base64 extraction (inspired by回忆版)
+                            chunk_base64 = None
+                            if result and isinstance(result, dict):
+                                if not result.get("Success", False): # Check API success flag first
+                                    logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API报告失败: {result.get('Message', '未知错误')}. FullResult: {str(result)[:300]}")
+                                    download_stream_successful = False; break
+
+                                data_payload = result.get("Data", {})
+                                if isinstance(data_payload, dict):
+                                    if "buffer" in data_payload: chunk_base64 = data_payload["buffer"]
+                                    elif "data" in data_payload and isinstance(data_payload.get("data"), dict) and "buffer" in data_payload["data"]: chunk_base64 = data_payload["data"]["buffer"]
+                                    else:
+                                        for field in ["Chunk", "Image", "Data", "Base64Data", "fileData"]: # Common field names
+                                            if field in data_payload and data_payload.get(field): chunk_base64 = data_payload[field]; break
+                                elif isinstance(data_payload, str) and data_payload: # Data itself is base64 string
+                                    chunk_base64 = data_payload
+                                
+                                # Fallback to check root result if not found in Data payload
+                                if not chunk_base64:
+                                    for field in ["data", "Data", "fileData", "Image", "base64Data"]:
+                                         if field in result and result.get(field): chunk_base64 = result[field]; break
+                            else: # result is not a dict or is None
+                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API报告失败: 无效的响应格式. FullResult: {str(result)[:300]}")
+                                download_stream_successful = False; break
+                            
+                            if not chunk_base64:
+                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 失败: 响应中未找到有效的图片数据。Response: {str(result)[:300]}")
+                                # If API returned success but no data for the first chunk of an unknown length download, it means no data.
+                                if data_len == 0 and i == 0 and result.get("Success", False):
+                                    logger.info(f"[{self.name}] API reported success but no data for first chunk (unknown length) for cmsg {cmsg.msg_id}. Assuming empty image or end of stream.")
+                                    # download_stream_successful remains True, but loop will break due to no chunk_base64 if num_chunks was > 1.
+                                    # If num_chunks was 1, all_chunks_data_list will be empty.
+                                else:
+                                     download_stream_successful = False
+                                break 
+                            
+                            try:
+                                if isinstance(chunk_base64, bytes): # If API directly returns bytes
+                                    chunk_data_bytes = chunk_base64
+                                elif isinstance(chunk_base64, str):
+                                    clean_base64 = chunk_base64.strip()
+                                    # It's common for some APIs to return base64 without padding.
+                                    # Python's b64decode can sometimes handle missing padding, but explicit padding is safer.
+                                    padding_needed = (4 - len(clean_base64) % 4) % 4
+                                    clean_base64 += '=' * padding_needed
+                                    chunk_data_bytes = base64.b64decode(clean_base64)
+                                else:
+                                    raise ValueError(f"chunk_base64 is neither str nor bytes: {type(chunk_base64)}")
+
+                                if not chunk_data_bytes and data_len == 0 and i == 0:
+                                    logger.info(f"[{self.name}] API returned empty decoded data for chunk 1 (unknown length) for cmsg {cmsg.msg_id}. Download stream ended.")
+                                    # download_stream_successful can remain true, all_chunks_data_list will be empty.
+                                    break # Break here, as there's no more data.
+                                
+                                if not chunk_data_bytes and data_len > 0:
+                                     logger.warning(f"[{self.name}] Decoded empty chunk {i+1}/{num_chunks} for cmsg {cmsg.msg_id} but expected data.")
+                                     # This might be an error or end of data if DataLen was an estimate.
+                                     # If API guarantees non-empty chunks until the end, this is an error.
+                                     # For now, we'll let it proceed, but it might lead to a smaller file.
+                                
+                                if chunk_data_bytes: # Only append if there's actual data
+                                    all_chunks_data_list.append(chunk_data_bytes)
+                                    actual_downloaded_size += len(chunk_data_bytes)
+                                    logger.debug(f"[{self.name}] 第 {i+1}/{num_chunks} (cmsg {cmsg.msg_id}) 段解码成功，大小: {len(chunk_data_bytes)} B. Total so far: {actual_downloaded_size} B")
+                                else: # No data, but no explicit error from API (e.g. first chunk of unknown length returned empty)
+                                    if data_len == 0 and i == 0: # Explicitly break if first chunk for unknown length is empty
+                                        break
+
+
+                            except Exception as decode_err:
+                                logger.error(f"[{self.name}] 第 {i+1}/{num_chunks} (cmsg {cmsg.msg_id}) 段Base64解码或处理失败: {decode_err}. Data (头100): {str(chunk_base64)[:100]}")
+                                download_stream_successful = False; break
+                except asyncio.TimeoutError:
+                    logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 超时。")
+                    download_stream_successful = False; break
+                except Exception as api_err:
+                    logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 发生API调用错误: {api_err}\n{traceback.format_exc()}")
+                    download_stream_successful = False; break
+            
+            # 4. 数据写入、刷新与同步
+            file_written_successfully = False
+            if download_stream_successful and all_chunks_data_list: # Ensure there's data to write
+                try:
+                    # Write to the target image_path (e.g., CACHE_DIR/AESKEY.tmp)
+                    with open(image_path, "wb") as f_write:
+                        for chunk_piece in all_chunks_data_list:
+                            f_write.write(chunk_piece)
+                        f_write.flush()
+                        if hasattr(os, 'fsync'):
+                            try: os.fsync(f_write.fileno())
+                            except OSError: pass # Ignore fsync errors on some systems like Windows
+                    
+                    final_size_on_disk = os.path.getsize(image_path)
+                    logger.info(f"[{self.name}] 所有分块成功写入并刷新到磁盘: {image_path}, 实际大小: {final_size_on_disk} B (Downloaded: {actual_downloaded_size} B)")
+                    if final_size_on_disk == 0 and actual_downloaded_size > 0 :
+                        logger.error(f"[{self.name}] 警告：数据已下载 ({actual_downloaded_size}B) 但写入文件后大小为0！Path: {image_path}")
+                        # This is a critical error, file write failed despite no IO Exception.
+                        file_written_successfully = False
+                    elif final_size_on_disk == 0 and actual_downloaded_size == 0:
+                        logger.info(f"[{self.name}] 下载完成，但未收到任何数据且文件大小为0 (可能为空图片或API指示无内容): {image_path}")
+                        # This might be acceptable for an empty image. PIL check will confirm.
+                        file_written_successfully = True 
+                    else:
+                        file_written_successfully = True
+
+                except IOError as io_err_write:
+                    logger.error(f"[{self.name}] 写入或刷新图片文件失败: {io_err_write}, Path: {image_path}")
+                except Exception as e_write:
+                    logger.error(f"[{self.name}] 写入文件时发生未知错误: {e_write}, Path: {image_path}\n{traceback.format_exc()}")
+
+            elif not all_chunks_data_list and download_stream_successful:
+                logger.warning(f"[{self.name}] 所有分块下载API调用成功，但未收集到任何数据块 for {image_path}. 文件将为空或不存在。")
+                # Consider this a failure unless an empty image is valid.
+                if os.path.exists(image_path) and os.path.getsize(image_path) == 0:
+                    file_written_successfully = True # Empty file was "successfully" written.
+                else: # No file or data
+                    download_stream_successful = False # Mark as failure for subsequent checks
+
+
+            # 5. 图片验证阶段 和 重命名 (if image_path was .tmp)
+            final_verified_path = None
+            if file_written_successfully:
+                await asyncio.sleep(0.1) 
+                try:
+                    if os.path.getsize(image_path) == 0:
+                        # Accept empty files if no data was ever downloaded, otherwise it's an error.
+                        if actual_downloaded_size == 0:
+                            logger.info(f"[{self.name}] Downloaded image file is empty (0 bytes), and 0 bytes were downloaded. Assuming valid empty image: {image_path}")
+                             # MODIFICATION START: Handle renaming for empty image using aeskey
+                            if hasattr(cmsg, 'img_aeskey') and cmsg.img_aeskey:
+                                final_filename_empty_aeskey = f"{cmsg.img_aeskey}.empty" # Or just aeskey if no ext desired for empty
+                                final_empty_path_aeskey = os.path.join(target_dir, final_filename_empty_aeskey)
+                                try:
+                                    if os.path.exists(final_empty_path_aeskey) and final_empty_path_aeskey != image_path: 
+                                        os.remove(final_empty_path_aeskey)
+                                    os.rename(image_path, final_empty_path_aeskey)
+                                    logger.info(f"[{self.name}] Renamed empty image from {image_path} to {final_empty_path_aeskey} using aeskey.")
+                                    final_verified_path = final_empty_path_aeskey
+                                except OSError as e_rename_empty_aes:
+                                    logger.error(f"[{self.name}] Failed to rename empty image {image_path} to use aeskey: {e_rename_empty_aes}")
+                                    final_verified_path = image_path # Fallback to original path
+                            else: # No aeskey for empty image
+                                logger.warning(f"[{self.name}] Empty image downloaded but no cmsg.img_aeskey available for msg {cmsg.msg_id}. Keeping original path: {image_path}")
+                                final_verified_path = image_path
+                            # MODIFICATION END
+                            # Set cmsg for empty image
+                            cmsg.image_path = final_verified_path
+                            cmsg.content = final_verified_path 
+                            cmsg.ctype = ContextType.IMAGE 
+                            cmsg._prepared = True
+                            return True # Successfully "downloaded" an empty image
+                        else: # Size is 0 but data *was* downloaded - this is an error.
+                            raise UnidentifiedImageError("Downloaded image file is empty despite data being received.")
+
+                    # Proceed with PIL verification for non-empty files
+                    with open(image_path, "rb") as f_read_verify: image_bytes_for_verify = f_read_verify.read()
+                    if not image_bytes_for_verify: raise UnidentifiedImageError("Downloaded image file read as empty for verification.")
+
+                    with Image.open(BytesIO(image_bytes_for_verify)) as img:
+                        img_format_detected = img.format # This is from PIL
+                        img_size = img.size
+                    logger.info(f"[{self.name}] 图片(cmsg {cmsg.msg_id})验证成功 (PIL): 格式={img_format_detected}, 大小={img_size}, 初始路径={image_path}")
+
+                    # Determine actual extension using imghdr for more reliability for file system
+                    import imghdr # Ensure imported
+                    actual_ext_imghdr = imghdr.what(None, h=image_bytes_for_verify) # Pass bytes directly
+                    
+                    if actual_ext_imghdr:
+                        actual_ext = actual_ext_imghdr.lower()
+                        if actual_ext == 'jpeg': actual_ext = 'jpg' 
+                        logger.info(f"[{self.name}] imghdr detected extension: .{actual_ext} for cmsg {cmsg.msg_id}")
+                    elif img_format_detected: 
+                        actual_ext = img_format_detected.lower()
+                        if actual_ext == 'jpeg': actual_ext = 'jpg'
+                        logger.info(f"[{self.name}] imghdr failed, using PIL detected extension: .{actual_ext} for cmsg {cmsg.msg_id}")
+                    else:
+                        actual_ext = "jpg" 
+                        logger.warning(f"[{self.name}] Could not determine image type via PIL or imghdr for cmsg {cmsg.msg_id}. Defaulting to '.jpg'.")
+
+                    # MODIFICATION START: Rename to use aeskey
+                    if hasattr(cmsg, 'img_aeskey') and cmsg.img_aeskey:
+                        final_filename_aeskey = f"{cmsg.img_aeskey}.{actual_ext}"
+                        final_new_path_aeskey = os.path.join(target_dir, final_filename_aeskey)
+                        try:
+                            if os.path.exists(final_new_path_aeskey) and final_new_path_aeskey != image_path:
+                                os.remove(final_new_path_aeskey) 
+                            os.rename(image_path, final_new_path_aeskey) # image_path is img_{msg_id}_{timestamp}.jpg
+                            logger.info(f"[{self.name}] Renamed cached image from {image_path} to {final_new_path_aeskey} using aeskey.")
+                            final_verified_path = final_new_path_aeskey
+                        except OSError as e_rename_aes:
+                            logger.error(f"[{self.name}] Failed to rename cached image {image_path} to use aeskey {final_new_path_aeskey}: {e_rename_aes}. Using original path.")
+                            final_verified_path = image_path 
+                    else: # No aeskey, keep original name (img_{msg_id}_{timestamp}.jpg)
+                        logger.warning(f"[{self.name}] No cmsg.img_aeskey found for msg {cmsg.msg_id}. Keeping original cache name: {image_path}")
+                        final_verified_path = image_path 
+                    # MODIFICATION END
+
+                    cmsg.image_path = final_verified_path
+                    cmsg.content = final_verified_path 
+                    cmsg.ctype = ContextType.IMAGE
+                    cmsg._prepared = True
+                    return True 
+
+                except UnidentifiedImageError as unident_err:
+                    logger.error(f"[{self.name}] 图片验证失败 (PIL无法识别格式) for cmsg {cmsg.msg_id}: {unident_err}, 文件: {image_path}")
+                    if os.path.exists(image_path): os.remove(image_path)
+                except ImportError: 
+                    logger.warning(f"[{self.name}] PIL (Pillow) 或 imghdr 库未安装，无法对图片进行严格验证: {image_path}")
+                    fsize = os.path.getsize(image_path) if os.path.exists(image_path) else 0
+                    if fsize > 100: 
+                        logger.info(f"[{self.name}] 图片下载完成 (无严格验证，大小: {fsize}B)，路径: {image_path}")
+                        # MODIFICATION START: Basic rename if no PIL and aeskey exists
+                        if hasattr(cmsg, 'img_aeskey') and cmsg.img_aeskey:
+                            final_name_no_pil_aes = f"{cmsg.img_aeskey}.jpg" # Default to jpg
+                            final_new_path_no_pil_aes = os.path.join(target_dir, final_name_no_pil_aes)
+                            try:
+                                if os.path.exists(final_new_path_no_pil_aes) and final_new_path_no_pil_aes != image_path: 
+                                    os.remove(final_new_path_no_pil_aes)
+                                os.rename(image_path, final_new_path_no_pil_aes)
+                                final_verified_path = final_new_path_no_pil_aes
+                                logger.info(f"[{self.name}] Renamed (no PIL) cached image from {image_path} to {final_verified_path} using aeskey.")
+                            except OSError: 
+                                final_verified_path = image_path
+                                logger.error(f"[{self.name}] Failed to rename (no PIL) cached image {image_path} to use aeskey. Keeping original.")
+                        else: 
+                            final_verified_path = image_path
+                            logger.warning(f"[{self.name}] No PIL and no aeskey. Keeping original name (no PIL): {image_path}")
+                        # MODIFICATION END
+                        
+                        cmsg.image_path = final_verified_path
+                        cmsg.content = final_verified_path
+                        cmsg.ctype = ContextType.IMAGE
+                        cmsg._prepared = True
+                        return True
+                    else:
+                        logger.warning(f"[{self.name}] 无严格验证且文件大小 ({fsize}B) 过小/为0，视为无效: {image_path}")
+                        if os.path.exists(image_path): os.remove(image_path)
+                except Exception as pil_verify_err: 
+                    logger.error(f"[{self.name}] 图片验证时发生未知错误 for cmsg {cmsg.msg_id}: {pil_verify_err}, 文件: {image_path}\n{traceback.format_exc()}")
+                    if os.path.exists(image_path): os.remove(image_path)
+            
+            # 6. 最终失败路径
+            logger.error(f"[{self.name}] 图片下载或验证未能成功 for cmsg {cmsg.msg_id} (Path: {image_path}). download_stream_ok={download_stream_successful}, file_written_ok={file_written_successfully}, data_collected={bool(all_chunks_data_list)}.")
+            if os.path.exists(image_path):
+                try: os.remove(image_path); logger.info(f"[{self.name}] 已删除下载失败或验证失败的图片文件: {image_path}")
+                except Exception as e_rm_fail: logger.error(f"[{self.name}] 删除失败的图片文件时出错 {image_path}: {e_rm_fail}")
+            
+            if cmsg: cmsg._prepared = False
+            return False
+
+        except Exception as outer_e: 
+            logger.critical(f"[{self.name}] _download_image_by_chunks 发生严重意外错误 for cmsg {cmsg.msg_id}, path {image_path if 'image_path' in locals() else 'Unknown'}: {outer_e}\n{traceback.format_exc()}")
+            path_to_clean = image_path if 'image_path' in locals() and os.path.exists(image_path) else None
+            if path_to_clean:
+                try: os.remove(path_to_clean); logger.info(f"[{self.name}] 意外错误后，已尝试删除图片文件: {path_to_clean}")
+                except Exception as e_rm_outer: logger.error(f"[{self.name}] 意外错误后，删除图片文件失败: {e_rm_outer}")
+            if cmsg: cmsg._prepared = False
+            return False
+        
+    async def _download_image_with_details(self, image_meta: dict, target_path: str) -> bool:
+        """
+        Downloads an image using detailed metadata, typically for referenced images.
+        Uses chunked download.
+
+        :param image_meta: Dict containing keys like 'msg_id_for_download', 'data_len', 
+                           'aeskey', 'downloader_wxid', 'original_sender_wxid'.
+        :param target_path: Full path where the image should be saved.
+        :return: True if download and verification are successful, False otherwise.
+        """
         import traceback
         import asyncio
         from io import BytesIO
         from PIL import Image, UnidentifiedImageError
 
-        try:
-            # 1. 检查是否已经存在相同的有效图片文件
-            tmp_dir = os.path.dirname(image_path)
-            os.makedirs(tmp_dir, exist_ok=True)
-            msg_id_str = str(cmsg.msg_id) # 确保是字符串
-            existing_files = [f for f in os.listdir(tmp_dir) if f.startswith(f"img_{msg_id_str}_")]
+        logger.info(f"[{self.name}] Attempting download with details: {image_meta} to {target_path}")
 
-            if existing_files:
-                latest_file = sorted(existing_files, key=lambda x: os.path.getmtime(os.path.join(tmp_dir, x)), reverse=True)[0]
-                existing_path = os.path.join(tmp_dir, latest_file)
-                if os.path.exists(existing_path) and os.path.getsize(existing_path) > 0:
-                    try:
-                        with open(existing_path, "rb") as f_exist:
-                            existing_bytes = f_exist.read()
-                        with Image.open(BytesIO(existing_bytes)) as img_exist:
-                            logger.info(f"[WX849] 使用已存在且有效的图片: {existing_path}, Format: {img_exist.format}, Size: {img_exist.size}")
-                            cmsg.image_path = existing_path
-                            cmsg.content = existing_path
-                            cmsg.ctype = ContextType.IMAGE
-                            cmsg._prepared = True
-                            return True
-                    except UnidentifiedImageError:
-                        logger.warning(f"[WX849] 已存在的图片 {existing_path} 无法识别 (UnidentifiedImageError)，将重新下载。")
-                    except Exception as img_err_exist:
-                        logger.warning(f"[WX849] 已存在的图片 {existing_path} 无效 ({img_err_exist})，将重新下载。")
-            
-            # 2. 获取API配置及计算分块信息
+        try:
+            # 1. Pre-check: Validate target_path and create directory
+            tmp_dir = os.path.dirname(target_path)
+            os.makedirs(tmp_dir, exist_ok=True)
+
+            # 2. Get API config and calculate chunk info
             api_host = conf().get("wx849_api_host", "127.0.0.1")
-            api_port = conf().get("wx849_api_port", 9011)
+            # For image downloads, often a specific media port is used, check if it's configured
+            api_port = conf().get("wx849_api_port", conf().get("wx849_api_port", 9011)) 
             protocol_version = conf().get("wx849_protocol_version", "849")
             api_path_prefix = "/api" if protocol_version in ["855", "ipad"] else "/VXAPI"
-            data_len = int(cmsg.image_info.get('length', '0')) or 229920 # 默认大小
-            chunk_size = 65536
-            num_chunks = (data_len + chunk_size - 1) // chunk_size or 1
+            
+            data_len_str = image_meta.get('data_len', '0')
+            try:
+                data_len = int(data_len_str)
+            except ValueError:
+                logger.error(f"[{self.name}] Invalid data_len '{data_len_str}' in image_meta. Using default 0.")
+                data_len = 0
+            
+            if data_len <= 0: # If data_len is 0 or invalid, try a default or log an error
+                logger.warning(f"[{self.name}] data_len is {data_len}. Download might be problematic or rely on API to handle it.")
+                # Fallback or error handling for zero data_len might be needed depending on API behavior
 
-            logger.info(f"[WX849] 开始分段下载图片至: {image_path}，总大小: {data_len} B，分 {num_chunks} 段")
+            chunk_size = 65536  # 64KB
+            num_chunks = (data_len + chunk_size - 1) // chunk_size if data_len > 0 else 1
+            if data_len == 0 and num_chunks == 1: # Special case for potentially unknown length but expecting at least one chunk
+                 logger.info(f"[{self.name}] data_len is 0, attempting to download as a single chunk of default size or as determined by API.")
 
-            # 3. 分块下载逻辑
+
+            logger.info(f"[{self.name}] Downloading referenced image to: {target_path}, Total Size: {data_len} B, Chunks: {num_chunks}")
+
+            # 3. Chunked download logic
             all_chunks_data_list = []
             download_stream_successful = True
+            actual_downloaded_size = 0
 
             for i in range(num_chunks):
                 start_pos = i * chunk_size
-                current_chunk_size = min(chunk_size, data_len - start_pos)
-                if current_chunk_size <= 0 and data_len > start_pos :
-                    current_chunk_size = data_len - start_pos
-                elif current_chunk_size <= 0:
-                    logger.warning(f"[WX849] 计算的 current_chunk_size ({current_chunk_size}) <=0，且无剩余数据。StartPos: {start_pos}, DataLen: {data_len}")
-                    break 
+                current_chunk_size = min(chunk_size, data_len - start_pos) if data_len > 0 else chunk_size # Default to chunk_size if data_len is unknown
+                
+                if data_len > 0 and current_chunk_size <= 0: # Ensure we don't try to download 0 bytes if data_len was positive
+                    logger.debug(f"[{self.name}] Calculated current_chunk_size <=0 with positive data_len. Breaking chunk loop. StartPos: {start_pos}, DataLen: {data_len}")
+                    break
+
+                # Ensure msg_id_for_download is an integer for the API call
+                msg_id_for_api = None
+                try:
+                    msg_id_for_api = int(image_meta['msg_id_for_download'])
+                except (ValueError, TypeError) as e:
+                    logger.error(f"[{self.name}] RefDownload Chunk {i+1} Error: 'msg_id_for_download' ({image_meta.get('msg_id_for_download')}) is not a valid integer: {e}")
+                    download_stream_successful = False
+                    break
 
                 params = {
-                    "MsgId": cmsg.msg_id,
-                    "ToWxid": cmsg.from_user_id,
-                    "Wxid": self.wxid,
-                    "DataLen": data_len,
-                    "CompressType": 0,
+                    "MsgId": msg_id_for_api, # MODIFIED: Use the integer version
+                    "ToWxid": image_meta.get('original_sender_wxid'), # The user who originally sent the image
+                    "Wxid": image_meta.get('downloader_wxid', self.wxid), # The WXID doing the download (our bot)
+                    "DataLen": data_len, 
+                    "CompressType": 0, 
                     "Section": {"StartPos": start_pos, "DataLen": current_chunk_size}
                 }
+                # Add aeskey if present and non-empty
+                if image_meta.get('aeskey'):
+                    params["Aeskey"] = image_meta['aeskey']
+
                 api_url = f"http://{api_host}:{api_port}{api_path_prefix}/Tools/DownloadImg"
-                logger.debug(f"[WX849] 下载分段 {i+1}/{num_chunks}: URL={api_url}, Params={params}")
+                logger.debug(f"[{self.name}] RefDownload Chunk {i+1}/{num_chunks}: URL={api_url}, Params={params}")
 
                 try:
                     async with aiohttp.ClientSession() as session:
-                        async with session.post(api_url, json=params, timeout=aiohttp.ClientTimeout(total=20)) as response:
+                        # Increased timeout for potentially slow media downloads
+                        async with session.post(api_url, json=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
                             if response.status != 200:
-                                logger.error(f"[WX849] 下载分段 {i+1} 失败, HTTP状态码: {response.status}")
-                                download_stream_successful = False; break
-                            result = await response.json()
+                                full_error_text = await response.text()
+                                logger.error(f"[{self.name}] RefDownload Chunk {i+1} HTTP Error: {response.status}, Response: {full_error_text[:500]}")
+                                download_stream_successful = False
+                                break
+                            
+                            try:
+                                result = await response.json()
+                            except aiohttp.ContentTypeError:
+                                raw_response_text = await response.text()
+                                logger.error(f"[{self.name}] RefDownload Chunk {i+1} API Error: Non-JSON response. Status: {response.status}. Response text (first 500 chars): {raw_response_text[:500]}")
+                                download_stream_successful = False
+                                break
+                            
+                            if not result or not isinstance(result, dict):
+                                logger.error(f"[{self.name}] RefDownload Chunk {i+1} API Error: Invalid or empty JSON response. FullResult: {result}")
+                                download_stream_successful = False
+                                break
+
                             if not result.get("Success", False):
-                                logger.error(f"[WX849] 下载分段 {i+1} API报告失败: {result.get('Message', '未知错误')}")
-                                download_stream_successful = False; break
+                                logger.error(f"[{self.name}] RefDownload Chunk {i+1} API Error: {result.get('Message', 'Unknown API error')}, FullResult: {result}")
+                                download_stream_successful = False
+                                break
                             
                             data_payload = result.get("Data", {})
                             chunk_base64 = None
                             if isinstance(data_payload, dict):
-                                if "buffer" in data_payload:
-                                    chunk_base64 = data_payload["buffer"]
-                                elif "data" in data_payload and isinstance(data_payload["data"], dict) and "buffer" in data_payload["data"]:
-                                    chunk_base64 = data_payload["data"]["buffer"]
-                                else:
-                                    for field in ["Chunk", "Image", "Data", "FileData"]:
-                                        if field in data_payload:
-                                            chunk_base64 = data_payload.get(field); break
-                            elif isinstance(data_payload, str):
+                                if "buffer" in data_payload: chunk_base64 = data_payload["buffer"]
+                                elif "data" in data_payload and isinstance(data_payload.get("data"), dict) and "buffer" in data_payload["data"]: chunk_base64 = data_payload["data"]["buffer"]
+                                else: 
+                                    for field in ["Chunk", "Image", "Data", "FileData"]: # Common field names
+                                        if field in data_payload: chunk_base64 = data_payload.get(field); break
+                            elif isinstance(data_payload, str): # Direct base64 string
                                 chunk_base64 = data_payload
                             
-                            if not chunk_base64 and isinstance(result, dict):
+                            if not chunk_base64 and isinstance(result, dict): # Fallback to check root result
                                  for field in ["data", "Data", "FileData", "Image"]:
-                                     if field in result and result.get(field): # Check if field exists and has a value
-                                         chunk_base64 = result.get(field); break
+                                     if field in result and result.get(field): chunk_base64 = result.get(field); break
 
                             if not chunk_base64:
-                                logger.error(f"[WX849] 下载分段 {i+1} 失败: 响应中未找到图片数据。Response: {str(result)[:200]}")
-                                download_stream_successful = False; break
+                                logger.error(f"[{self.name}] RefDownload Chunk {i+1} Error: No image data found in API response. Response: {str(result)[:200]}")
+                                download_stream_successful = False
+                                break
                             
                             try:
                                 if not isinstance(chunk_base64, str):
                                     if isinstance(chunk_base64, bytes):
-                                        try:
-                                            chunk_base64 = chunk_base64.decode('utf-8')
-                                        except UnicodeDecodeError:
-                                            logger.error(f"[WX849] 第 {i+1}/{num_chunks} 段 chunk_base64 是 bytes 但无法以 utf-8 解码。")
-                                            raise ValueError("chunk_base64是bytes但无法解码为str")
-                                    else:
-                                        logger.error(f"[WX849] 第 {i+1}/{num_chunks} 段 chunk_base64 不是字符串或字节类型: {type(chunk_base64)}.")
-                                        raise ValueError(f"chunk_base64不是字符串或字节类型: {type(chunk_base64)}")
+                                        try: chunk_base64 = chunk_base64.decode('utf-8')
+                                        except UnicodeDecodeError: raise ValueError("chunk_base64 is bytes but cannot be utf-8 decoded.")
+                                    else: raise ValueError(f"chunk_base64 is not str or bytes: {type(chunk_base64)}")
                                 
                                 clean_base64 = chunk_base64.strip()
                                 padding = (4 - len(clean_base64) % 4) % 4
                                 clean_base64 += '=' * padding
                                 chunk_data_bytes = base64.b64decode(clean_base64)
                                 all_chunks_data_list.append(chunk_data_bytes)
-                                logger.debug(f"[WX849] 第 {i+1}/{num_chunks} 段解码成功，大小: {len(chunk_data_bytes)} B")
+                                actual_downloaded_size += len(chunk_data_bytes)
+                                logger.debug(f"[{self.name}] RefDownload Chunk {i+1}/{num_chunks} decoded, size: {len(chunk_data_bytes)} B. Total so far: {actual_downloaded_size} B")
                             except Exception as decode_err:
-                                logger.error(f"[WX849] 第 {i+1}/{num_chunks} 段Base64解码失败: {decode_err}. Data (头100): {str(chunk_base64)[:100]}")
-                                download_stream_successful = False; break
+                                logger.error(f"[{self.name}] RefDownload Chunk {i+1}/{num_chunks} Base64 decode error: {decode_err}. Data (first 100): {str(chunk_base64)[:100]}")
+                                download_stream_successful = False
+                                break
                 except asyncio.TimeoutError:
-                    logger.error(f"[WX849] 下载分段 {i+1} 超时。")
-                    download_stream_successful = False; break
-                except Exception as api_err:
-                    logger.error(f"[WX849] 下载分段 {i+1} 发生API调用错误: {api_err}")
-                    logger.error(traceback.format_exc())
-                    download_stream_successful = False; break
+                    logger.error(f"[{self.name}] RefDownload Chunk {i+1} timed out.")
+                    download_stream_successful = False
+                    break
+                except Exception as api_call_err:
+                    logger.error(f"[{self.name}] RefDownload Chunk {i+1} API call error: {api_call_err}\n{traceback.format_exc()}")
+                    download_stream_successful = False
+                    break
             
-            # 4. 数据写入、刷新与同步
+            # 4. Data writing, flushing, and syncing
             file_written_successfully = False
             if download_stream_successful and all_chunks_data_list:
                 try:
-                    with open(image_path, "wb") as f_write:
+                    with open(target_path, "wb") as f_write:
                         for chunk_piece in all_chunks_data_list:
                             f_write.write(chunk_piece)
                         f_write.flush()
-                        os.fsync(f_write.fileno())
-                    actual_file_size = os.path.getsize(image_path)
-                    logger.info(f"[WX849] 所有分块成功写入并刷新到磁盘: {image_path}, 实际大小: {actual_file_size} B")
-                    if actual_file_size == 0 and sum(len(c) for c in all_chunks_data_list) > 0 :
-                        logger.error(f"[WX849] 警告：数据已下载 ({sum(len(c) for c in all_chunks_data_list)}B) 但写入文件后大小为0！Path: {image_path}")
+                        if hasattr(os, 'fsync'): # fsync might not be available on all OS (e.g. some Windows setups)
+                            try:
+                                os.fsync(f_write.fileno())
+                            except OSError as e_fsync:
+                                logger.warning(f"[{self.name}] os.fsync failed for {target_path}: {e_fsync}. Continuing without fsync.")
+                        else:
+                            logger.debug(f"[{self.name}] os.fsync not available on this system.")
+
+                    final_file_size = os.path.getsize(target_path)
+                    logger.info(f"[{self.name}] RefDownload: All chunks written to disk: {target_path}, Actual Final Size: {final_file_size} B (Expected: {data_len} B, Downloaded: {actual_downloaded_size} B)")
+                    if final_file_size == 0 and actual_downloaded_size > 0:
+                        logger.error(f"[{self.name}] RefDownload WARNING: Data downloaded ({actual_downloaded_size}B) but written file size is 0! Path: {target_path}")
                     else:
                         file_written_successfully = True
-                except IOError as io_err_write:
-                    logger.error(f"[WX849] 写入或刷新图片文件失败: {io_err_write}, Path: {image_path}")
-                except Exception as e_write:
-                    logger.error(f"[WX849] 写入文件时发生未知错误: {e_write}, Path: {image_path}")
-                    logger.error(traceback.format_exc())
+                except IOError as io_err_write_final:
+                    logger.error(f"[{self.name}] RefDownload: Failed to write or flush image file: {io_err_write_final}, Path: {target_path}")
+                except Exception as e_write_final:
+                    logger.error(f"[{self.name}] RefDownload: Unknown error during file write: {e_write_final}, Path: {target_path}\n{traceback.format_exc()}")
             elif not all_chunks_data_list and download_stream_successful:
-                logger.warning(f"[WX849] 所有分块下载API调用成功，但未收集到任何数据块。")
+                logger.warning(f"[{self.name}] RefDownload: API calls successful, but no data chunks collected for {target_path}.")
             
-            # 5. 图片验证阶段
+            # 5. Image Verification Stage
             if file_written_successfully:
-                await asyncio.sleep(0.1) 
+                await asyncio.sleep(0.1) # Brief pause to ensure file system operations complete
                 try:
-                    with open(image_path, "rb") as f_read_verify:
-                        image_bytes_for_verify = f_read_verify.read()
+                    with open(target_path, "rb") as f_read_verify_final:
+                        image_bytes_for_verify_final = f_read_verify_final.read()
                     
-                    if not image_bytes_for_verify:
-                        logger.error(f"[WX849] 图片文件下载后读取为空: {image_path}")
-                        raise UnidentifiedImageError("Downloaded image file is empty after read for verification.")
+                    if not image_bytes_for_verify_final:
+                        logger.error(f"[{self.name}] RefDownload: Image file empty after download and read for verification: {target_path}")
+                        raise UnidentifiedImageError("Downloaded image file is empty for verification.")
 
-                    with Image.open(BytesIO(image_bytes_for_verify)) as img:
-                        img_format = img.format
-                        img_size = img.size
-                        logger.info(f"[WX849] 图片验证成功 (PIL): 格式={img_format}, 大小={img_size}, 路径={image_path}")
-                        cmsg.image_path = image_path
-                        cmsg.content = image_path
-                        cmsg.ctype = ContextType.IMAGE
-                        cmsg._prepared = True
+                    with Image.open(BytesIO(image_bytes_for_verify_final)) as img_final:
+                        img_format_final = img_final.format
+                        img_size_final = img_final.size
+                        logger.info(f"[{self.name}] RefDownload: Image verification successful (PIL): Format={img_format_final}, Size={img_size_final}, Path={target_path}")
                         return True
-                except UnidentifiedImageError as unident_err:
-                    logger.error(f"[WX849] 图片验证失败 (PIL无法识别格式): {unident_err}, 文件: {image_path}")
-                    if os.path.exists(image_path): os.remove(image_path)
-                    cmsg._prepared = False
+                except UnidentifiedImageError as unident_err_final:
+                    logger.error(f"[{self.name}] RefDownload: Image verification failed (PIL UnidentifiedImageError): {unident_err_final}, File: {target_path}")
+                    if os.path.exists(target_path): os.remove(target_path)
                     return False
-                except AttributeError as attr_err:
-                    err_str = str(attr_err)
-                    # Catches "property 'mode' of 'JpegImageFile' object has no setter" 
-                    # AND "'JpegImageFile' object has no attribute 'layers'" (another PIL internal error for some JPEGs)
-                    if "property 'mode' of" in err_str and "object has no setter" in err_str or \
-                       "'JpegImageFile' object has no attribute 'layers'" in err_str:
-                        logger.warning(f"[WX849] 图片验证遇到特定AttributeError (可能是误报): {err_str}, 文件: {image_path}")
-                        logger.warning(f"[WX849] 将保留文件 {image_path} 并标记为 \'未准备好\' (cmsg._prepared=False)，交由下游处理。")
-                        cmsg.image_path = image_path
-                        cmsg.content = image_path
-                        cmsg.ctype = ContextType.IMAGE
-                        cmsg._prepared = False 
-                        return True 
-                    else:
-                        logger.error(f"[WX849] 图片验证失败 (非特定AttributeError): {attr_err}, 文件: {image_path}")
-                        logger.error(traceback.format_exc())
-                        if os.path.exists(image_path): os.remove(image_path)
-                        cmsg._prepared = False
-                        return False
-                except ImportError:
-                    logger.warning("[WX849] PIL (Pillow) 库未安装，无法对图片进行严格验证。")
-                    fsize = os.path.getsize(image_path) if os.path.exists(image_path) else 0
-                    if fsize > 10000:
-                        logger.info(f"[WX849] 图片下载完成 (无PIL验证，大小: {fsize}B)，路径: {image_path}")
-                        cmsg.image_path = image_path
-                        cmsg.content = image_path
-                        cmsg.ctype = ContextType.IMAGE
-                        cmsg._prepared = True
+                except ImportError: # Should have been caught earlier, but as a safeguard
+                    logger.warning("[WX849] RefDownload: PIL (Pillow) library not installed, cannot perform strict image verification.")
+                    fsize_final_no_pil = os.path.getsize(target_path) if os.path.exists(target_path) else 0
+                    if fsize_final_no_pil > 1000: # Heuristic: >1KB might be a valid small image
+                        logger.info(f"[{self.name}] RefDownload: Image download likely complete (No PIL verification, size: {fsize_final_no_pil}B), Path: {target_path}")
                         return True
                     else:
-                        logger.warning(f"[WX849] PIL未安装且文件大小 ({fsize}B) 过小，视为无效: {image_path}")
-                        if os.path.exists(image_path): os.remove(image_path)
-                        cmsg._prepared = False
+                        logger.warning(f"[{self.name}] RefDownload: PIL not installed AND file size ({fsize_final_no_pil}B) is too small. Invalid: {target_path}")
+                        if os.path.exists(target_path): os.remove(target_path)
                         return False
-                except Exception as pil_verify_err:
-                    logger.error(f"[WX849] 图片验证时发生未知PIL错误: {pil_verify_err}, 文件: {image_path}")
-                    logger.error(traceback.format_exc())
-                    if os.path.exists(image_path): os.remove(image_path)
-                    cmsg._prepared = False
+                except Exception as pil_verify_err_final:
+                    logger.error(f"[{self.name}] RefDownload: Unknown PIL verification error: {pil_verify_err_final}, File: {target_path}\n{traceback.format_exc()}")
+                    if os.path.exists(target_path): os.remove(target_path)
                     return False
             
-            # 6. 最终失败路径
-            logger.error(f"[WX849] 图片下载或验证未能成功。download_stream_successful={download_stream_successful}, file_written_successfully={file_written_successfully}, all_chunks_data_list is {'not ' if not all_chunks_data_list else ''}empty. Path: {image_path}")
-            if os.path.exists(image_path):
+            # 6. Final Failure Path (if not returned True already)
+            logger.error(f"[{self.name}] RefDownload: Image download or verification failed. StreamOK={download_stream_successful}, WrittenOK={file_written_successfully}, DataCollected={bool(all_chunks_data_list)}. Path: {target_path}")
+            if os.path.exists(target_path): # Cleanup if file exists but process failed
                 try:
-                    os.remove(image_path)
-                    logger.info(f"[WX849] 已删除下载失败或验证失败的图片文件: {image_path}")
-                except Exception as e_remove_final:
-                    logger.error(f"[WX849] 删除失败的图片文件时出错: {e_remove_final}, Path: {image_path}")
-            cmsg._prepared = False
+                    os.remove(target_path)
+                    logger.info(f"[{self.name}] RefDownload: Deleted failed/unverified image file: {target_path}")
+                except Exception as e_remove_cleanup:
+                    logger.error(f"[{self.name}] RefDownload: Error deleting failed image file: {e_remove_cleanup}, Path: {target_path}")
             return False
 
-        except Exception as outer_e:
-            logger.critical(f"[WX849] _download_image_by_chunks 发生严重意外错误: {outer_e}")
-            logger.critical(traceback.format_exc())
-            current_image_path_for_cleanup = image_path 
-            if current_image_path_for_cleanup and os.path.exists(current_image_path_for_cleanup):
-                try:
-                    os.remove(current_image_path_for_cleanup)
-                    logger.info(f"[WX849] 意外错误后，已尝试删除图片文件: {current_image_path_for_cleanup}")
-                except Exception as e_remove_outer: # pragma: no cover
-                    logger.error(f"[WX849] 意外错误后，删除图片文件失败: {e_remove_outer}")
-            if cmsg: # Check if cmsg is not None
-                cmsg._prepared = False
+        except Exception as outer_e_details:
+            logger.critical(f"[{self.name}] _download_image_with_details: Critical unexpected error: {outer_e_details}\n{traceback.format_exc()}")
+            path_to_cleanup_outer = target_path
+            if path_to_cleanup_outer and os.path.exists(path_to_cleanup_outer):
+                try: os.remove(path_to_cleanup_outer)
+                except Exception as e_remove_critical: logger.error(f"[{self.name}] Critical error: Failed to cleanup {path_to_cleanup_outer}: {e_remove_critical}")
             return False
-
-            # 获取API配置
-            api_host = conf().get("wx849_api_host", "127.0.0.1")
-            api_port = conf().get("wx849_api_port", 9011)
-            protocol_version = conf().get("wx849_protocol_version", "849")
-
-            # 确定API路径前缀
-            if protocol_version == "855" or protocol_version == "ipad":
-                api_path_prefix = "/api"
-            else:
-                api_path_prefix = "/VXAPI"
-
-            # 估计图片大小
-            data_len = int(cmsg.image_info.get('length', '0'))
-            if data_len <= 0:
-                data_len = 229920  # 默认大小
-
-            # 分段大小
-            chunk_size = 65536  # 64KB - 必须使用这个大小，API限制每次最多下载64KB
-
-            # 计算分段数
-            num_chunks = (data_len + chunk_size - 1) // chunk_size
-            if num_chunks <= 0:
-                num_chunks = 1  # 至少分1段
-
-            # 不限制最大分段数，确保完整下载图片
-            # 但记录一个警告，如果分段数过多
-            if num_chunks > 20:
-                logger.warning(f"[WX849] 图片分段数较多 ({num_chunks})，下载可能需要较长时间")
-
-            logger.info(f"[WX849] 开始分段下载图片，总大小: {data_len} 字节，分 {num_chunks} 段下载")
-
-            # 创建一个空文件
-            with open(image_path, "wb") as f:
-                pass
-
-            # 分段下载
-            all_chunks_success = True
-            for i in range(num_chunks):
-                start_pos = i * chunk_size
-                current_chunk_size = min(chunk_size, data_len - start_pos)
-                if current_chunk_size <= 0:
-                    current_chunk_size = chunk_size
-
-                # 构建API请求参数 - 使用与原始框架相同的格式
-                params = {
-                    "MsgId": cmsg.msg_id,
-                    "ToWxid": cmsg.from_user_id,
-                    "Wxid": self.wxid,
-                    "DataLen": data_len,
-                    "CompressType": 0,
-                    "Section": {
-                        "StartPos": start_pos,
-                        "DataLen": current_chunk_size
-                    }
-                }
-
-                logger.debug(f"[WX849] 尝试下载图片分段: MsgId={cmsg.msg_id}, ToWxid={cmsg.from_user_id}, DataLen={data_len}, StartPos={start_pos}, ChunkSize={current_chunk_size}")
-
-                # 构建完整的API URL - 尝试不同的API路径
-                # 首先尝试 /VXAPI/Tools/DownloadImg
-                api_url = f"http://{api_host}:{api_port}{api_path_prefix}/Tools/DownloadImg"
-
-                # 记录完整的请求URL和参数
-                logger.debug(f"[WX849] 图片下载API URL: {api_url}")
-                logger.debug(f"[WX849] 图片下载API参数: {params}")
-
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(api_url, json=params) as response:
-                            if response.status != 200:
-                                logger.error(f"[WX849] 下载图片分段失败, 状态码: {response.status}")
-                                all_chunks_success = False
-                                break
-
-                            # 获取响应内容
-                            result = await response.json()
-
-                            # 检查响应是否成功
-                            if not result.get("Success", False):
-                                logger.error(f"[WX849] 下载图片分段失败: {result.get('Message', '未知错误')}")
-                                all_chunks_success = False
-                                break
-
-                            # 提取图片数据 - 适应原始框架的响应格式
-                            data = result.get("Data", {})
-
-                            # 记录响应结构以便调试
-                            if isinstance(data, dict):
-                                logger.debug(f"[WX849] 响应Data字段包含键: {list(data.keys())}")
-
-                            # 尝试不同的响应格式
-                            chunk_base64 = None
-
-                            # 参考 WechatAPI/Client/tool_extension.py 中的处理方式
-                            if isinstance(data, dict):
-                                # 如果是字典，尝试获取buffer字段
-                                if "buffer" in data:
-                                    logger.debug(f"[WX849] 从data.buffer字段获取图片数据")
-                                    chunk_base64 = data.get("buffer")
-                                elif "data" in data and isinstance(data["data"], dict) and "buffer" in data["data"]:
-                                    logger.debug(f"[WX849] 从data.data.buffer字段获取图片数据")
-                                    chunk_base64 = data["data"]["buffer"]
-                                else:
-                                    # 尝试其他可能的字段名
-                                    for field in ["Chunk", "Image", "Data", "FileData", "data"]:
-                                        if field in data:
-                                            logger.debug(f"[WX849] 从data.{field}字段获取图片数据")
-                                            chunk_base64 = data.get(field)
-                                            break
-                            elif isinstance(data, str):
-                                # 如果直接返回字符串，可能就是base64数据
-                                logger.debug(f"[WX849] Data字段是字符串，直接使用")
-                                chunk_base64 = data
-
-                            # 如果在data中没有找到，尝试在整个响应中查找
-                            if not chunk_base64 and isinstance(result, dict):
-                                for field in ["data", "Data", "FileData", "Image"]:
-                                    if field in result:
-                                        logger.debug(f"[WX849] 从result.{field}字段获取图片数据")
-                                        chunk_base64 = result.get(field)
-                                        break
-
-                            if not chunk_base64:
-                                logger.error(f"[WX849] 下载图片分段失败: 响应中无图片数据")
-                                # 避免记录大量数据，只记录数据类型和长度
-                                if isinstance(data, dict):
-                                    logger.debug(f"[WX849] 响应数据类型: 字典, 键: {list(data.keys())}")
-                                elif isinstance(data, str):
-                                    logger.debug(f"[WX849] 响应数据类型: 字符串, 长度: {len(data)}")
-                                else:
-                                    logger.debug(f"[WX849] 响应数据类型: {type(data)}")
-                                all_chunks_success = False
-                                break
-
-                            # 解码数据并保存图片分段
-                            try:
-                                # 尝试确定数据类型并正确处理
-                                if isinstance(chunk_base64, str):
-                                    # 尝试作为Base64解码
-                                    try:
-                                        # 修复：确保字符串是有效的Base64
-                                        # 移除可能的非Base64字符
-                                        clean_base64 = chunk_base64.strip()
-                                        # 确保长度是4的倍数，如果不是，添加填充
-                                        padding = 4 - (len(clean_base64) % 4) if len(clean_base64) % 4 != 0 else 0
-                                        clean_base64 = clean_base64 + ('=' * padding)
-
-                                        chunk_data = base64.b64decode(clean_base64)
-                                        logger.debug(f"[WX849] 成功解码Base64数据，大小: {len(chunk_data)} 字节")
-                                    except Exception as decode_err:
-                                        logger.error(f"[WX849] Base64解码失败: {decode_err}")
-                                        # 如果解码失败，记录错误并跳过这个分段
-                                        logger.error(f"[WX849] 无法解码的数据: {chunk_base64[:100]}...")
-                                        raise decode_err
-                                elif isinstance(chunk_base64, bytes):
-                                    # 已经是二进制数据，直接使用
-                                    logger.debug(f"[WX849] 使用二进制数据，大小: {len(chunk_base64)} 字节")
-                                    chunk_data = chunk_base64
-                                elif isinstance(chunk_base64, dict):
-                                    # 如果是字典，尝试从字典中提取数据
-                                    logger.debug(f"[WX849] 数据是字典类型，键: {list(chunk_base64.keys())}")
-                                    # 尝试从常见的键中获取数据
-                                    found_data = False
-                                    for key in ['data', 'Data', 'content', 'Content', 'image', 'Image']:
-                                        if key in chunk_base64:
-                                            data_value = chunk_base64[key]
-                                            if isinstance(data_value, str):
-                                                try:
-                                                    # 清理和填充Base64字符串
-                                                    clean_base64 = data_value.strip()
-                                                    padding = 4 - (len(clean_base64) % 4) if len(clean_base64) % 4 != 0 else 0
-                                                    clean_base64 = clean_base64 + ('=' * padding)
-
-                                                    chunk_data = base64.b64decode(clean_base64)
-                                                    logger.debug(f"[WX849] 从字典键 {key} 成功解码Base64数据，大小: {len(chunk_data)} 字节")
-                                                    found_data = True
-                                                    break
-                                                except Exception as e:
-                                                    logger.debug(f"[WX849] 从字典键 {key} 解码Base64失败: {e}")
-                                                    continue
-                                            elif isinstance(data_value, bytes):
-                                                chunk_data = data_value
-                                                logger.debug(f"[WX849] 从字典键 {key} 获取到二进制数据，大小: {len(data_value)} 字节")
-                                                found_data = True
-                                                break
-
-                                    # 如果常见键中没有找到，尝试遍历所有键
-                                    if not found_data:
-                                        logger.debug(f"[WX849] 在常见键中未找到数据，尝试遍历所有键")
-                                        for key, value in chunk_base64.items():
-                                            if isinstance(value, str) and len(value) > 10:  # 只处理可能是Base64的长字符串
-                                                try:
-                                                    # 清理和填充Base64字符串
-                                                    clean_base64 = value.strip()
-                                                    padding = 4 - (len(clean_base64) % 4) if len(clean_base64) % 4 != 0 else 0
-                                                    clean_base64 = clean_base64 + ('=' * padding)
-
-                                                    chunk_data = base64.b64decode(clean_base64)
-                                                    logger.debug(f"[WX849] 从字典键 {key} 成功解码Base64数据，大小: {len(chunk_data)} 字节")
-                                                    found_data = True
-                                                    break
-                                                except Exception:
-                                                    continue
-                                            elif isinstance(value, bytes) and len(value) > 10:
-                                                chunk_data = value
-                                                logger.debug(f"[WX849] 从字典键 {key} 获取到二进制数据，大小: {len(value)} 字节")
-                                                found_data = True
-                                                break
-                                            elif isinstance(value, dict) and len(value) > 0:
-                                                # 递归处理嵌套字典
-                                                logger.debug(f"[WX849] 发现嵌套字典，键: {key}，尝试递归处理")
-                                                for subkey, subvalue in value.items():
-                                                    if isinstance(subvalue, str) and len(subvalue) > 10:
-                                                        try:
-                                                            # 清理和填充Base64字符串
-                                                            clean_base64 = subvalue.strip()
-                                                            padding = 4 - (len(clean_base64) % 4) if len(clean_base64) % 4 != 0 else 0
-                                                            clean_base64 = clean_base64 + ('=' * padding)
-
-                                                            chunk_data = base64.b64decode(clean_base64)
-                                                            logger.debug(f"[WX849] 从嵌套字典键 {key}.{subkey} 成功解码Base64数据，大小: {len(chunk_data)} 字节")
-                                                            found_data = True
-                                                            break
-                                                        except Exception:
-                                                            continue
-                                                    elif isinstance(subvalue, bytes) and len(subvalue) > 10:
-                                                        chunk_data = subvalue
-                                                        logger.debug(f"[WX849] 从嵌套字典键 {key}.{subkey} 获取到二进制数据，大小: {len(subvalue)} 字节")
-                                                        found_data = True
-                                                        break
-                                                if found_data:
-                                                    break
-
-                                    # 如果仍然没有找到有效数据，尝试使用整个字典的字符串表示
-                                    if not found_data:
-                                        logger.warning(f"[WX849] 无法从字典中提取有效的图片数据，尝试使用默认空数据")
-                                        # 创建一个空的JPEG图片数据（最小的有效JPEG文件）
-                                        chunk_data = b'\xff\xd8\xff\xe0\x00\x10\x4a\x46\x49\x46\x00\x01\x01\x01\x00\x48\x00\x48\x00\x00\xff\xdb\x00\x43\x00\xff\xc0\x00\x11\x08\x00\x01\x00\x01\x03\x01\x11\x00\x02\x11\x01\x03\x11\x01\xff\xc4\x00\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xc4\x00\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00\xff\xd9'
-                                        logger.debug(f"[WX849] 使用默认空JPEG数据，大小: {len(chunk_data)} 字节")
-                                else:
-                                    # 其他类型，尝试转换为字符串后处理
-                                    logger.warning(f"[WX849] 未知数据类型: {type(chunk_base64)}，尝试转换为字符串")
-                                    try:
-                                        # 尝试转换为字符串
-                                        str_value = str(chunk_base64)
-                                        if len(str_value) > 10:  # 只处理可能有意义的字符串
-                                            try:
-                                                # 清理和填充Base64字符串
-                                                clean_base64 = str_value.strip()
-                                                padding = 4 - (len(clean_base64) % 4) if len(clean_base64) % 4 != 0 else 0
-                                                clean_base64 = clean_base64 + ('=' * padding)
-
-                                                chunk_data = base64.b64decode(clean_base64)
-                                                logger.debug(f"[WX849] 成功将未知类型转换为Base64并解码，大小: {len(chunk_data)} 字节")
-                                            except Exception as e:
-                                                logger.warning(f"[WX849] 无法将未知类型转换为Base64: {e}")
-                                                # 使用默认空JPEG数据
-                                                chunk_data = b'\xff\xd8\xff\xe0\x00\x10\x4a\x46\x49\x46\x00\x01\x01\x01\x00\x48\x00\x48\x00\x00\xff\xdb\x00\x43\x00\xff\xc0\x00\x11\x08\x00\x01\x00\x01\x03\x01\x11\x00\x02\x11\x01\x03\x11\x01\xff\xc4\x00\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xc4\x00\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00\xff\xd9'
-                                                logger.debug(f"[WX849] 使用默认空JPEG数据，大小: {len(chunk_data)} 字节")
-                                        else:
-                                            # 字符串太短，使用默认空JPEG数据
-                                            chunk_data = b'\xff\xd8\xff\xe0\x00\x10\x4a\x46\x49\x46\x00\x01\x01\x01\x00\x48\x00\x48\x00\x00\xff\xdb\x00\x43\x00\xff\xc0\x00\x11\x08\x00\x01\x00\x01\x03\x01\x11\x00\x02\x11\x01\x03\x11\x01\xff\xc4\x00\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xc4\x00\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00\xff\xd9'
-                                            logger.debug(f"[WX849] 使用默认空JPEG数据，大小: {len(chunk_data)} 字节")
-                                    except Exception as e:
-                                        logger.error(f"[WX849] 处理未知数据类型失败: {e}")
-                                        # 使用默认空JPEG数据
-                                        chunk_data = b'\xff\xd8\xff\xe0\x00\x10\x4a\x46\x49\x46\x00\x01\x01\x01\x00\x48\x00\x48\x00\x00\xff\xdb\x00\x43\x00\xff\xc0\x00\x11\x08\x00\x01\x00\x01\x03\x01\x11\x00\x02\x11\x01\x03\x11\x01\xff\xc4\x00\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xc4\x00\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00\xff\xd9'
-                                        logger.debug(f"[WX849] 使用默认空JPEG数据，大小: {len(chunk_data)} 字节")
-
-                                # 验证数据是否为有效的图片数据
-                                if 'chunk_data' in locals() and chunk_data:
-                                    # 追加到文件
-                                    with open(image_path, "ab") as f:
-                                        f.write(chunk_data)
-                                    logger.debug(f"[WX849] 第 {i+1}/{num_chunks} 段下载成功，大小: {len(chunk_data)} 字节")
-                                else:
-                                    logger.error(f"[WX849] 第 {i+1}/{num_chunks} 段下载失败: 无有效数据")
-                                    all_chunks_success = False
-                                    break
-                            except Exception as decode_err:
-                                logger.error(f"[WX849] 解码Base64图片分段数据失败: {decode_err}")
-                                all_chunks_success = False
-                                break
-                except Exception as api_err:
-                    logger.error(f"[WX849] 调用图片分段API失败: {api_err}")
-                    all_chunks_success = False
-                    break
-
-            if all_chunks_success:
-                # 检查文件大小
-                file_size = os.path.getsize(image_path)
-                logger.info(f"[WX849] 分段下载图片成功，总大小: {file_size} 字节")
-
-                # 如果文件大小与预期不符，记录警告
-                if file_size < data_len * 0.8:  # 如果实际大小小于预期的80%
-                    logger.warning(f"[WX849] 图片文件大小 ({file_size} 字节) 小于预期 ({data_len} 字节)，可能下载不完整")
-
-                    # 如果文件太小，尝试再次下载缺失的部分
-                    if file_size > 0 and file_size < data_len:
-                        logger.info(f"[WX849] 尝试下载缺失的图片部分，从位置 {file_size} 开始")
-
-                        # 计算剩余部分的分段数
-                        remaining_size = data_len - file_size
-                        remaining_chunks = (remaining_size + chunk_size - 1) // chunk_size
-
-                        # 下载剩余部分
-                        remaining_success = True
-                        for i in range(remaining_chunks):
-                            start_pos = file_size + i * chunk_size
-                            current_chunk_size = min(chunk_size, data_len - start_pos)
-
-                            if current_chunk_size <= 0:
-                                break
-
-                            # 构建API请求参数
-                            params = {
-                                "MsgId": cmsg.msg_id,
-                                "ToWxid": cmsg.from_user_id,
-                                "Wxid": self.wxid,
-                                "DataLen": data_len,
-                                "CompressType": 0,
-                                "Section": {
-                                    "StartPos": start_pos,
-                                    "DataLen": current_chunk_size
-                                }
-                            }
-
-                            logger.debug(f"[WX849] 尝试下载缺失的图片分段: MsgId={cmsg.msg_id}, StartPos={start_pos}, ChunkSize={current_chunk_size}")
-
-                            try:
-                                async with aiohttp.ClientSession() as session:
-                                    async with session.post(api_url, json=params) as response:
-                                        if response.status != 200:
-                                            logger.error(f"[WX849] 下载缺失的图片分段失败, 状态码: {response.status}")
-                                            remaining_success = False
-                                            break
-
-                                        result = await response.json()
-
-                                        if not result.get("Success", False):
-                                            logger.error(f"[WX849] 下载缺失的图片分段失败: {result.get('Message', '未知错误')}")
-                                            remaining_success = False
-                                            break
-
-                                        # 提取图片数据
-                                        data = result.get("Data", {})
-                                        chunk_base64 = None
-
-                                        # 参考 WechatAPI/Client/tool_extension.py 中的处理方式
-                                        if isinstance(data, dict):
-                                            if "buffer" in data:
-                                                chunk_base64 = data.get("buffer")
-                                            elif "data" in data and isinstance(data["data"], dict) and "buffer" in data["data"]:
-                                                chunk_base64 = data["data"]["buffer"]
-
-                                        if chunk_base64:
-                                            try:
-                                                chunk_data = base64.b64decode(chunk_base64)
-                                                with open(image_path, "ab") as f:
-                                                    f.write(chunk_data)
-                                                logger.debug(f"[WX849] 缺失的图片分段下载成功，大小: {len(chunk_data)} 字节")
-                                            except Exception as e:
-                                                logger.error(f"[WX849] 解码缺失的图片分段数据失败: {e}")
-                                                remaining_success = False
-                                                break
-                                        else:
-                                            logger.error(f"[WX849] 下载缺失的图片分段失败: 响应中无图片数据")
-                                            remaining_success = False
-                                            break
-                            except Exception as e:
-                                logger.error(f"[WX849] 下载缺失的图片分段失败: {e}")
-                                remaining_success = False
-                                break
-
-                        if remaining_success:
-                            file_size = os.path.getsize(image_path)
-                            logger.info(f"[WX849] 成功下载缺失的图片部分，最终大小: {file_size} 字节")
-
-                # 检查文件是否存在且有效
-                if os.path.exists(image_path) and os.path.getsize(image_path) > 0:
-                    # 验证图片文件是否为有效的图片格式
-                    try:
-                        from PIL import Image
-                        try:
-                            # 尝试打开图片文件
-                            with Image.open(image_path) as img:
-                                # 获取图片格式和大小
-                                img_format = img.format
-                                img_size = img.size
-                                logger.info(f"[WX849] 图片验证成功: 格式={img_format}, 大小={img_size}")
-                        except Exception as img_err:
-                            logger.error(f"[WX849] 图片验证失败，可能不是有效的图片文件: {img_err}")
-                            # 尝试修复图片文件
-                            try:
-                                # 读取文件内容
-                                with open(image_path, "rb") as f:
-                                    img_data = f.read()
-
-                                # 尝试查找JPEG文件头和尾部标记
-                                jpg_header = b'\xff\xd8'
-                                jpg_footer = b'\xff\xd9'
-
-                                if img_data.startswith(jpg_header) and img_data.endswith(jpg_footer):
-                                    logger.info(f"[WX849] 图片文件有效的JPEG头尾标记，但内部可能有损坏")
-                                else:
-                                    # 查找JPEG头部标记的位置
-                                    header_pos = img_data.find(jpg_header)
-                                    if header_pos >= 0:
-                                        # 查找JPEG尾部标记的位置
-                                        footer_pos = img_data.rfind(jpg_footer)
-                                        if footer_pos > header_pos:
-                                            # 提取有效的JPEG数据
-                                            valid_data = img_data[header_pos:footer_pos+2]
-                                            # 重写文件
-                                            with open(image_path, "wb") as f:
-                                                f.write(valid_data)
-                                            logger.info(f"[WX849] 尝试修复图片文件，提取了 {len(valid_data)} 字节的有效JPEG数据")
-                            except Exception as fix_err:
-                                logger.error(f"[WX849] 尝试修复图片文件失败: {fix_err}")
-                    except ImportError:
-                        logger.warning(f"[WX849] PIL库未安装，无法验证图片有效性")
-
-                    # 设置图片本地路径
-                    cmsg.image_path = image_path
-
-                    # 更新消息内容为图片路径，以便DOW框架处理
-                    cmsg.content = image_path
-
-                    # 确保消息类型为IMAGE
-                    cmsg.ctype = ContextType.IMAGE
-
-                    # 设置_prepared标志，表示图片已准备好
-                    cmsg._prepared = True
-
-                    # 图片已经在回调处理时发送到DOW框架，这里只记录日志
-                    logger.info(f"[WX849] 图片下载完成，保存到: {cmsg.image_path}")
-
-                    # 返回True表示下载成功
-                    return True
-                else:
-                    logger.error(f"[WX849] 图片文件不存在或为空: {image_path}")
-                    return False
-        except Exception as e:
-            logger.error(f"[WX849] 下载图片失败: {e}")
-            logger.error(f"[WX849] 详细错误: {traceback.format_exc()}")
 
     def _get_image(self, msg_id):
         """获取图片数据"""
         # 查找图片文件
-        tmp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp", "images")
+        tmp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tmp", "wx849_img_cache")
 
         # 查找匹配的图片文件
         if os.path.exists(tmp_dir):
@@ -2977,242 +2916,214 @@ class WX849Channel(ChatChannel):
         logger.info(f"收到表情消息: ID:{cmsg.msg_id} 来自:{cmsg.from_user_id} 发送人:{cmsg.sender_wxid} \nXML内容: {cmsg.content}")
 
     def _process_xml_message(self, cmsg: WX849Message):
-        """处理XML消息"""
+        """
+        处理 XML 类型的消息，主要是 Type 57 引用和 Type 5 分享链接。
+        会修改 cmsg 的 ctype 和 content 属性。
+        """
         import xml.etree.ElementTree as ET
-        import re # re might be used by other parts of the original XML processing
+        import re 
+        import asyncio 
+        import os 
+        import time 
+        import traceback
+        import tempfile 
+        import threading 
+        from bridge.context import ContextType 
 
-        # Attempt to parse as a text quote first
         try:
-            if isinstance(cmsg.content, str) and cmsg.content.strip().startswith(("<msg", "<?xml")):
-                root = ET.fromstring(cmsg.content)
-                appmsg_node = root.find(".//appmsg") # Find appmsg anywhere in the XML
-                if appmsg_node is not None:
-                    msg_type_node = appmsg_node.find("type")
-                    if msg_type_node is not None and msg_type_node.text == "57":
-                        refermsg_node = appmsg_node.find("refermsg")
-                        if refermsg_node is not None:
-                            refer_type_node = refermsg_node.find("type")
-                            if refer_type_node is not None and refer_type_node.text == "1": # Text quote
-                                title_node = appmsg_node.find("title") # User's question
-                                refer_content_node = refermsg_node.find("content") # Quoted text
-                                refer_displayname_node = refermsg_node.find("displayname") # Quoted user's display name
+            msg_xml = ET.fromstring(cmsg.content)
+            appmsg = msg_xml.find("appmsg")
 
-                                user_question = title_node.text if title_node is not None and title_node.text else ""
-                                quoted_text = refer_content_node.text if refer_content_node is not None and refer_content_node.text else ""
-                                quoter_display_name = refer_displayname_node.text if refer_displayname_node is not None and refer_displayname_node.text else "对方"
+            # 1. 处理引用消息 (Type 57)
+            if appmsg is not None and appmsg.findtext("type") == "57":
+                refermsg = appmsg.find("refermsg")
+                if refermsg is not None:
+                    refer_type = refermsg.findtext("type")
+                    title = appmsg.findtext("title") # User's question part / command
+                    displayname = refermsg.findtext("displayname") # Quoter's display name
 
-                                if user_question and quoted_text:
-                                    cmsg.content = (
-                                        f"用户针对以下消息提问：\"{user_question}\"\n\n"
-                                        f"被引用的消息来自\"{quoter_display_name}\"：\n\"{quoted_text}\"\n\n"
-                                        f"请基于被引用的消息回答用户的问题。"
-                                    )
-                                    cmsg.is_processed_text_quote = True
-                                    # Ensure ctype is XML, as chat_channel expects to see XML type first
-                                    # It should already be set or will be set shortly, but good to be explicit.
-                                    try:
-                                        cmsg.ctype = ContextType.XML
-                                    except AttributeError: # ContextType.XML might not be defined if there was an issue earlier
-                                        if not hasattr(ContextType, 'XML'):
-                                            setattr(ContextType, 'XML', 'XML')
-                                        cmsg.ctype = ContextType.XML
+                    # 1.1 处理文本引用 (refermsg type=1)
+                    if refer_type == "1":
+                        quoted_text = refermsg.findtext("content")
+                        if title and displayname and quoted_text:
+                            prompt = (
+                                f"用户针对以下消息提问：\"{title}\"\n\n"
+                                f"被引用的消息来自\"{displayname}\"：\n\"{quoted_text}\"\n\n"
+                                f"请基于被引用的消息回答用户的问题。"
+                            )
+                            cmsg.content = prompt
+                            cmsg.is_processed_text_quote = True 
+                            cmsg.ctype = ContextType.TEXT 
+                            logger.info(f"[{self.name}] Processed text quote msg {cmsg.msg_id}. Set type to TEXT.")
+                            return 
 
-                                    # MODIFIED: If this is a processed quote in a group, change ctype to TEXT
-                                    # so it goes through the standard group trigger logic in handle_group.
-                                    if cmsg.is_group:
-                                        logger.debug(f"[WX849] Processed XML text quote (type 57) in group for msg {cmsg.msg_id}, converting ctype to TEXT for trigger evaluation.")
+                    # 1.2 处理聊天记录引用 (refermsg type=49 -> inner appmsg type=19)
+                    elif refer_type == "49":
+                        quoted_content_raw = refermsg.findtext("content")
+                        if quoted_content_raw:
+                            try:
+                                inner_xml_root = ET.fromstring(quoted_content_raw)
+                                inner_appmsg = inner_xml_root.find("appmsg")
+                                if inner_appmsg is not None and inner_appmsg.findtext("type") == "19": 
+                                    chat_record_desc = inner_appmsg.findtext("des") 
+                                    if title and displayname and chat_record_desc:
+                                        prompt = (
+                                            f"用户针对以下聊天记录提问：\"{title}\"\n\n"
+                                            f"被引用的聊天记录来自\"{displayname}\"：\n（摘要：{chat_record_desc}）\n\n"
+                                            f"请基于被引用的聊天记录内容回答用户的问题（注意：聊天记录可能包含多条消息）。"
+                                        )
+                                        cmsg.content = prompt
+                                        cmsg.is_processed_text_quote = True 
                                         cmsg.ctype = ContextType.TEXT
-
-                                    logger.info(f"[WX849] 已成功将消息 ID {cmsg.msg_id} 解析为文本引用。新内容: {cmsg.content[:150]}...")
-                                    # self._extract_sender_from_xml(cmsg, root) # Optionally extract sender if needed for quote context
-                                    return # IMPORTANT: Return early to prevent other XML processing
-
-                            elif refer_type_node is not None and refer_type_node.text == "49": # Potentially chat history or other complex appmsg
-                                title_node = appmsg_node.find("title") # User's question (outer appmsg)
-                                nested_xml_str_node = refermsg_node.find("content") # Content of refermsg, which is an XML string
-                                refer_displayname_node = refermsg_node.find("displayname") # Display name of the user who forwarded
-
-                                user_question = title_node.text if title_node is not None and title_node.text else ""
-                                nested_xml_str = nested_xml_str_node.text if nested_xml_str_node is not None and nested_xml_str_node.text else ""
-                                quoter_display_name = refer_displayname_node.text if refer_displayname_node is not None and refer_displayname_node.text else "有人"
-
-                                if user_question and nested_xml_str:
-                                    try:
-                                        nested_root = ET.fromstring(nested_xml_str)
-                                        nested_appmsg_node = nested_root.find(".//appmsg") # Find appmsg in the nested XML
-                                        if nested_appmsg_node is not None:
-                                            inner_msg_type_node = nested_appmsg_node.find("type")
-                                            if inner_msg_type_node is not None and inner_msg_type_node.text == "19": # Type 19: Chat History
-                                                des_node = nested_appmsg_node.find("des")
-                                                chat_history_summary = des_node.text if des_node is not None and des_node.text else ""
-
-                                                if chat_history_summary:
-                                                    # Construct content string (ensure newlines are actual \n)
-                                                    cmsg.content = (
-                                                        f"用户针对以下聊天记录提问：“{user_question}”\n\n"
-                                                        f"以下是由“{quoter_display_name}”转发的聊天记录摘要：\n“{chat_history_summary}”\n\n"
-                                                        f"请基于聊天记录摘要回答用户的问题。"
-                                                    )
-                                                    cmsg.is_processed_text_quote = True # Reuse the flag
-                                                    try:
-                                                        cmsg.ctype = ContextType.XML
-                                                    except AttributeError:
-                                                        if not hasattr(ContextType, 'XML'):
-                                                            setattr(ContextType, 'XML', 'XML')
-                                                        cmsg.ctype = ContextType.XML
-
-                                                    # MODIFIED: If this is a processed quote in a group, change ctype to TEXT
-                                                    # so it goes through the standard group trigger logic in handle_group.
-                                                    if cmsg.is_group:
-                                                        logger.debug(f"[WX849] Processed XML chat history quote (type 49->19) in group for msg {cmsg.msg_id}, converting ctype to TEXT for trigger evaluation.")
-                                                        cmsg.ctype = ContextType.TEXT
-                                                    
-                                                    logger.info(f"[WX849] 已成功将消息 ID {cmsg.msg_id} 解析为引用的聊天记录 (type 19)。新内容: {cmsg.content[:150]}...")
-                                                    return # IMPORTANT: Return early
-                                                else:
-                                                    logger.debug(f"[WX849] Chat history (type 19) in refermsg for msg {cmsg.msg_id} has empty 'des' field.")
-                                            else:
-                                                logger.debug(f"[WX849] Nested appmsg in refermsg (type 49) for msg {cmsg.msg_id} is not type 19 chat history. Actual type: {inner_msg_type_node.text if inner_msg_type_node is not None else 'N/A'}")
-                                        else:
-                                            logger.debug(f"[WX849] No 'appmsg' found in nested XML of refermsg (type 49) for msg {cmsg.msg_id}.")
-                                    except ET.ParseError as e_nested:
-                                        logger.warning(f"[WX849] Failed to parse nested XML (refermsg content) for msg {cmsg.msg_id}: {e_nested}. Nested XML snippet: {nested_xml_str[:200]}")
-                                    except Exception as e_general_nested: # Catch any other unexpected errors during nested processing
-                                        logger.error(f"[WX849] Unexpected error processing nested XML for chat history in msg {cmsg.msg_id}: {e_general_nested}")
-
-        except ET.ParseError as e:
-            logger.debug(f"[WX849] XML parsing error during quote detection for msg {cmsg.msg_id}: {e}. Will proceed with generic XML handling.")
-        except Exception as e:
-            logger.warning(f"[WX849] Unexpected error during quote detection for msg {cmsg.msg_id}: {e}. Will proceed with generic XML handling.")
-
-        # Original XML processing logic starts here
-        # Ensure ctype is set to XML (this might be redundant if already set above, but acts as a fallback)
-        try:
-            cmsg.ctype = ContextType.XML
-        except AttributeError:
-            logger.error("[WX849] ContextType.XML 不存在，尝试动态添加")
-            if not hasattr(ContextType, 'XML'):
-                setattr(ContextType, 'XML', 'XML')
-                logger.info("[WX849] 运行时添加 ContextType.XML 类型成功")
-            try:
-                cmsg.ctype = ContextType.XML
-            except:
-                logger.error("[WX849] 设置 ContextType.XML 失败，回退到 TEXT 类型")
-                cmsg.ctype = ContextType.TEXT
-        
-        # 添加调试日志，记录原始XML内容
-        logger.debug(f"[WX849] 开始处理XML消息，消息ID: {cmsg.msg_id}, 内容长度: {len(cmsg.content)}")
-        if cmsg.content and len(cmsg.content) > 0:
-            logger.debug(f"[WX849] XML内容前100字符: {cmsg.content[:100]}")
-        else:
-            logger.debug(f"[WX849] XML内容为空")
-        
-        original_content = cmsg.content
-        is_xml_content = original_content.strip().startswith("<?xml") or original_content.strip().startswith("<msg")
-
-        # 尝试解析 appmsg 类型 5 (分享链接)
-        if is_xml_content:
-            try:
-                root = ET.fromstring(original_content)
-                appmsg_element = root.find("appmsg")
-                if appmsg_element is not None:
-                    app_type_element = appmsg_element.find("type")
-                    app_type = -1
-                    if app_type_element is not None and app_type_element.text is not None:
+                                        logger.info(f"[{self.name}] Processed chat record quote msg {cmsg.msg_id}. Set type to TEXT.")
+                                        return 
+                            except ET.ParseError:
+                                logger.debug(f"[{self.name}] Inner XML parsing failed for type 49 refermsg content in msg {cmsg.msg_id}")
+                            except Exception as e_inner:
+                                logger.warning(f"[{self.name}] Error processing inner XML for type 49 refermsg in msg {cmsg.msg_id}: {e_inner}")
+                    
+                    # MODIFICATION START: Handling for referenced image (refer_type == '3' implied by finding 'img' node)
+                    elif refer_type == "3" and (quoted_content_raw := refermsg.findtext("content")): 
+                        # This 'elif' specifically targets Type 3 (image) references if an explicit check for refer_type is desired.
+                        # The original code relied on finding an 'img' node within the quoted_content_raw.
+                        
+                        original_image_svrid = refermsg.findtext("svrid") # Still useful for logging/context
+                        
                         try:
-                            app_type = int(app_type_element.text)
-                        except ValueError:
-                            logger.debug(f"[WX849] XML AppMsg type is not a valid integer: {app_type_element.text}")
+                            inner_xml_root = ET.fromstring(quoted_content_raw)
+                            img_node = inner_xml_root.find("img")
 
-                    if app_type == 5:  # Type 5: URL/分享链接
-                        url_element = appmsg_element.find("url")
-                        title_element = appmsg_element.find("title") # 可选：获取标题用于日志或调试
-                        title = title_element.text if title_element is not None else "N/A"
+                            if img_node is not None:
+                                extracted_refer_aeskey = img_node.get("aeskey")
+                                # title and displayname are already defined above for Type 57
 
-                        if url_element is not None and url_element.text:
-                            extracted_url = url_element.text.strip() # 使用 .strip() 清理可能的空白字符
-                            if extracted_url.startswith("//"):
-                                extracted_url = "http:" + extracted_url
-                                logger.debug(f"[WX849] AppMsg Type 5 URL was scheme-relative, prepended http:. New URL: {extracted_url}")
-                            
-                            # 再次检查处理后的URL是否有效(可选，但推荐)
-                            if not extracted_url or not (extracted_url.startswith("http://") or extracted_url.startswith("https://")):
-                                logger.warning(f"[WX849] AppMsg Type 5 URL after processing is still invalid: {extracted_url}. Original: {url_element.text}")
-                                # 如果URL处理后仍然无效，可以选择不设置SHARING类型或返回，避免后续插件出错
-                                # 此处为了保持原逻辑，我们继续，但JinaSum仍可能因其他原因拒绝
-                                cmsg.content = url_element.text # 保留原始URL以防万一或进行不同处理
-                                # cmsg.ctype = ContextType.TEXT # 或者将其视为普通文本
-                            else:
-                                cmsg.content = extracted_url
+                                if extracted_refer_aeskey and hasattr(self, 'image_cache_dir') and self.image_cache_dir:
+                                    logger.debug(f"[{self.name}] Msg {cmsg.msg_id} (Type 57 quote) references image with aeskey: {extracted_refer_aeskey}. User command: '{title}'. Original svrid: {original_image_svrid}")
+                                    
+                                    found_cached_path = None
+                                    # Try common extensions or the extension determined during caching
+                                    # Assuming caching logic (Phase A3) saves with original extension or defaults to .jpg
+                                    # Let's try common ones, prioritising .jpg
+                                    possible_extensions = ['.jpg', '.jpeg', '.png', '.gif'] 
+                                    # A more robust way would be to store file extension along with aeskey if it can vary
+                                    # or ensure a consistent extension like .jpg during caching.
+                                    
+                                    for ext in possible_extensions:
+                                        # Ensure consistent naming with caching logic (Phase A3)
+                                        # Example: cached_file_name = f"{cmsg.img_aeskey}{file_extension}"
+                                        potential_path = os.path.join(self.image_cache_dir, f"{extracted_refer_aeskey}{ext}")
+                                        if os.path.exists(potential_path):
+                                            found_cached_path = potential_path
+                                            break
+                                    
+                                    if found_cached_path:
+                                        logger.info(f"[{self.name}] Found cached image for aeskey {extracted_refer_aeskey} at {found_cached_path} for msg {cmsg.msg_id}")
+                                        
+                                        cmsg.content = title if title else "" 
+                                        cmsg.ctype = ContextType.TEXT
+                                        cmsg.original_user_question = title if title else "" 
+                                        cmsg.referenced_image_path = found_cached_path
+                                        cmsg.is_processed_image_quote = True 
+                                        
+                                        if displayname:
+                                            cmsg.quoter_display_name = displayname
+                                        cmsg.quoted_image_id = extracted_refer_aeskey # Using aeskey as a quoted image identifier
+                                        
+                                        logger.info(f"[{self.name}] Successfully processed referenced image (from cache) for msg {cmsg.msg_id}. Set ctype=TEXT. Path: {cmsg.referenced_image_path}")
+                                        return # Crucial: stop further processing of this XML
+                                    else:
+                                        logger.warning(f"[{self.name}] Referenced image with aeskey {extracted_refer_aeskey} not found in cache ({self.image_cache_dir}) for msg {cmsg.msg_id}. Fallback: No API download configured for this path.")
+                                        # If you had a working API download as fallback, it would go here.
+                                        # For now, if not in cache, it will be treated as an unhandled Type 57 quote.
 
-                            cmsg.ctype = ContextType.SHARING
-                            logger.info(f"[WX849] 成功转换XML AppMsg Type 5 (分享链接) 为 SHARING. URL: {cmsg.content}, Title: {title}")
-                            return
+                                else: # extracted_refer_aeskey is None or image_cache_dir not set
+                                    if not extracted_refer_aeskey:
+                                        logger.warning(f"[{self.name}] Referenced image in msg {cmsg.msg_id} has no aeskey in its XML, cannot look up in cache.")
+                                    if not (hasattr(self, 'image_cache_dir') and self.image_cache_dir):
+                                         logger.error(f"[{self.name}] Image cache directory not configured. Cannot look up referenced image for msg {cmsg.msg_id}")
 
-                    # 可在此处添加对其他 app_type 的处理，例如文件(6)、小程序(33)等
-                    # elif app_type == 6: # 文件
-                    # ...
-                    # return
+                            # else: img_node was None (not an image reference within the content)
+                            # This case would also fall through.
 
-            except ET.ParseError as xml_err:
-                logger.warning(f"[WX849] 解析XML (用于appmsg type 5检测) 失败: {xml_err}, 内容: {original_content[:200]}")
-            except Exception as e_parse:
-                logger.error(f"[WX849] 处理XML (用于appmsg type 5检测) 时发生未知错误: {e_parse}, 内容: {original_content[:200]}")
-        
-        # 处理群聊/私聊消息发送者 (如果上面的 app_type 5 没有 return，则会执行这里)
-        if cmsg.is_group or cmsg.from_user_id.endswith("@chatroom"):
-            cmsg.is_group = True
-            # 先默认设置一个空的sender_wxid
-            cmsg.sender_wxid = ""
-            
-            # 尝试从XML中提取发送者信息
-            if is_xml_content:
-                logger.debug(f"[WX849] XML消息：尝试从XML提取发送者")
-                try:
-                    # 使用正则表达式从XML中提取fromusername属性
-                    match = re.search(r'fromusername\s*=\s*["\'](.*?)["\']', original_content)
-                    if match:
-                        cmsg.sender_wxid = match.group(1)
-                        logger.debug(f"[WX849] XML消息：从XML提取的发送者ID: {cmsg.sender_wxid}")
-                    else:
-                        # 尝试从元素中提取
-                        match = re.search(r'<fromusername>(.*?)</fromusername>', original_content)
-                        if match:
-                            cmsg.sender_wxid = match.group(1)
-                            logger.debug(f"[WX849] XML消息：从XML元素提取的发送者ID: {cmsg.sender_wxid}")
+                        except ET.ParseError as e_parse_inner:
+                            logger.debug(f"[{self.name}] Failed to parse inner XML for referenced msg content in msg {cmsg.msg_id}: {e_parse_inner}. Content: {quoted_content_raw[:100] if quoted_content_raw else 'None'}")
+                        except Exception as e_proc_ref_img: 
+                            logger.error(f"[{self.name}] Error processing potential image reference in msg {cmsg.msg_id}: {e_proc_ref_img}\n{traceback.format_exc()}")
+                    # MODIFICATION END
+                    
+                    # Fallback for unhandled Type 57 messages (if not text, chat record, or successfully processed image quote from cache)
+                    if not (hasattr(cmsg, 'is_processed_text_quote') and cmsg.is_processed_text_quote or \
+                            hasattr(cmsg, 'is_processed_image_quote') and cmsg.is_processed_image_quote):
+                        logger.debug(f"[{self.name}] Unhandled Type 57 refermsg (type='{refer_type}') in msg {cmsg.msg_id}. Title: '{title}'. Will be treated as generic XML.")
+                        if title:
+                             cmsg.content = f"用户引用了一个消息并提问：\"{title}\" (类型：{refer_type}，未特殊处理)"
                         else:
-                            logger.debug("[WX849] XML消息：未找到fromusername")
-                except Exception as e:
-                    logger.debug(f"[WX849] XML消息：提取发送者失败: {e}")
-            
-            # 如果无法从XML提取，尝试传统的分割方法
-            if not cmsg.sender_wxid:
-                split_content = original_content.split(":\n", 1)
-                if len(split_content) > 1 and not split_content[0].startswith("<"):
-                    cmsg.sender_wxid = split_content[0]
-                    logger.debug(f"[WX849] XML消息：使用分割方法提取的发送者ID: {cmsg.sender_wxid}")
+                             cmsg.content = f"用户引用了一个未处理类型的消息 (类型：{refer_type})"
+                        cmsg.ctype = ContextType.XML 
+
+            elif appmsg is not None and appmsg.findtext("type") == "5":
+                url = appmsg.findtext("url")
+                link_title = appmsg.findtext("title") 
+                if url:
+                    if not url.startswith("http"):
+                        url = "http:" + url if url.startswith("//") else "http://" + url
+                    if "." in url and " " not in url: # Basic URL validation
+                        cmsg.content = url 
+                        cmsg.ctype = ContextType.SHARING 
+                        logger.info(f"[{self.name}] Processed sharing link msg {cmsg.msg_id}. URL: {url}, Title: {link_title}")
+                        return 
+                    else:
+                         logger.warning(f"[{self.name}] Invalid URL extracted from sharing link msg {cmsg.msg_id}: {url}")
                 else:
-                    # 处理没有换行的情况
-                    split_content = original_content.split(":", 1)
-                    if len(split_content) > 1 and not split_content[0].startswith("<"):
-                        cmsg.sender_wxid = split_content[0]
-                        logger.debug(f"[WX849] XML消息：使用冒号分割提取的发送者ID: {cmsg.sender_wxid}")
+                    logger.warning(f"[{self.name}] Sharing link msg {cmsg.msg_id} has no URL.")
             
-            # 如果仍然无法提取，使用默认值
-            if not cmsg.sender_wxid:
-                cmsg.sender_wxid = f"未知用户_{cmsg.from_user_id}"
-                logger.debug(f"[WX849] XML消息：使用默认发送者ID: {cmsg.sender_wxid}")
-        else:
-            # 私聊消息
-            cmsg.sender_wxid = cmsg.from_user_id
-            cmsg.is_group = False
+            # Check if any processing flag was set or if it's a sharing link
+            processed_flags_true = (hasattr(cmsg, 'is_processed_text_quote') and cmsg.is_processed_text_quote) or \
+                                   (hasattr(cmsg, 'is_processed_image_quote') and cmsg.is_processed_image_quote)
+            is_sharing_link = hasattr(cmsg, 'ctype') and cmsg.ctype == ContextType.SHARING
+
+            if not (processed_flags_true or is_sharing_link):
+
+                if appmsg is not None: # Only default to XML if it was an appmsg
+                    cmsg.ctype = ContextType.XML 
+                    logger.debug(f"[{self.name}] XML message {cmsg.msg_id} (appmsg type: {appmsg.findtext('type') if appmsg is not None else 'N/A'}) not specifically processed. Final ctype={cmsg.ctype}.")
+                # else: If not an appmsg, its ctype should have been determined earlier or it's not XML.
         
-        # 设置actual_user_id和actual_user_nickname
-        cmsg.actual_user_id = cmsg.sender_wxid or cmsg.from_user_id
-        cmsg.actual_user_nickname = cmsg.sender_wxid or cmsg.from_user_id
+        except ET.ParseError: # Error parsing the main cmsg.content
+            logger.debug(f"[{self.name}] Failed to parse content as XML for msg {cmsg.msg_id}. Content: {str(cmsg.content)[:200]}... Assuming not XML or malformed.")
+            # Do not return here, let it fall through. If ctype not set, it might be handled by caller.
+            # Or, if it's guaranteed to be XML if this method is called, then this is an error state.
+            pass
+
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Unexpected error processing XML message {cmsg.msg_id}: {e}\n{traceback.format_exc()}")
+            # Fallback ctype if an unexpected error occurs
+            if not hasattr(cmsg, 'ctype') or cmsg.ctype == ContextType.XML: # Avoid overriding if already set to TEXT etc.
+                 cmsg.ctype = ContextType.TEXT # Default to TEXT to show error to user potentially
+                 cmsg.content = "[XML消息处理时发生内部错误]"
+            return # Return on unhandled exception to prevent further issues
+
+        # Group message sender processing - this seems out of place if msg_xml parsing failed.
+        # This should ideally be higher up or only if msg_xml was successfully parsed.
+        # However, to match the original structure provided:
+        if msg_xml is not None and cmsg.is_group and not (hasattr(cmsg, 'actual_user_id') and cmsg.actual_user_id):
+            try:
+                 # 'fromusername' is usually on the root <msg> for group messages if it's the raw XML
+                 sender_id_xml = msg_xml.get('fromusername') 
+                 if sender_id_xml:
+                     cmsg.sender_wxid = sender_id_xml # This might be the group ID itself
+                     cmsg.actual_user_id = sender_id_xml # This needs to be the actual sender in group
+                     logger.debug(f"[{self.name}] Attempted to extract sender_wxid '{sender_id_xml}' from group XML msg {cmsg.msg_id}")
+                     # This logic for group sender needs careful review based on actual XML structure for group messages.
+                     # Often, for group messages, the sender is in a different field or part of a CDATA section.
+            except Exception as e_sender:
+                logger.error(f"[{self.name}] Error extracting sender from group XML msg {cmsg.msg_id}: {e_sender}")
         
-        # 输出日志，显示完整XML内容
-        logger.info(f"收到XML消息: ID:{cmsg.msg_id} 来自:{cmsg.from_user_id} 发送人:{cmsg.sender_wxid}\nXML内容: {cmsg.content}")
+        processed_text_quote_status = getattr(cmsg, 'is_processed_text_quote', False)
+        processed_image_quote_status = getattr(cmsg, 'is_processed_image_quote', False)
+        current_ctype = getattr(cmsg, 'ctype', 'Unknown') # Default to 'Unknown' if not set
+        logger.debug(f"[{self.name}] Finished _process_xml_message for {cmsg.msg_id}. Final ctype={current_ctype}, is_text_quote={processed_text_quote_status}, is_image_quote={processed_image_quote_status}")
 
     def _process_system_message(self, cmsg):
         """处理系统消息"""

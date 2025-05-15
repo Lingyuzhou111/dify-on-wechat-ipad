@@ -312,6 +312,7 @@ class WX849Channel(ChatChannel):
 
     def _cleanup_cached_images(self):
         """Cleans up expired image files from the cache directory."""
+        import glob
         if not hasattr(self, 'image_cache_dir') or not self.image_cache_dir:
             logger.warning(f"[{self.name}] Image cache directory not configured. Skipping cleanup.")
             return
@@ -2013,172 +2014,219 @@ class WX849Channel(ChatChannel):
             logger.error(traceback.format_exc())
             return False
 
+# FILE_PATH: channel/wx849/wx849_channel.py
+# MODIFIED_LINES_START
     async def _download_image_by_chunks(self, cmsg: WX849Message, image_path: str): # Added type hints
         """使用分段下载方法获取图片, 并在成功后缓存."""
         import traceback
         import asyncio
+        import base64 # Ensure base64 is imported
+        import aiohttp # Ensure aiohttp is imported
         from io import BytesIO
         from PIL import Image, UnidentifiedImageError
-        import shutil # MODIFICATION: Added import for shutil
-        import os # Ensure os is imported (likely already is)
-        from bridge.context import ContextType # Ensure ContextType is imported
+        import shutil 
+        import os 
+        from bridge.context import ContextType 
+        from common.log import logger # Ensure logger is imported
+        from config import conf # Ensure conf is imported
+
+
+        # --- MODIFICATION BLOCK START ---
+        authoritative_total_len = -1 # -1 indicates unknown, 0 is a valid length
+        api_total_len_confirmed = False
+        # --- MODIFICATION BLOCK END ---
 
         try:
             # 1. 确保目标目录存在
             target_dir = os.path.dirname(image_path)
-            os.makedirs(target_dir, exist_ok=True) # target_dir is self.image_cache_dir
+            os.makedirs(target_dir, exist_ok=True)
 
             # 2. 获取API配置及计算分块信息
             api_host = conf().get("wx849_api_host", "127.0.0.1")
-            api_port = conf().get("wx849_api_port", 9011) # Assuming 9011 is the media port
+            api_port = conf().get("wx849_api_port", 9011) 
             protocol_version = conf().get("wx849_protocol_version", "849")
             api_path_prefix = "/api" if protocol_version in ["855", "ipad"] else "/VXAPI"
             
-            data_len_str = '0'
+            data_len_from_xml_str = '0'
             if hasattr(cmsg, 'image_info') and isinstance(cmsg.image_info, dict):
-                data_len_str = cmsg.image_info.get('length', '0')
-            elif hasattr(cmsg, 'img_length'):
-                data_len_str = cmsg.img_length
+                data_len_from_xml_str = cmsg.image_info.get('length', '0')
+            elif hasattr(cmsg, 'img_length'): # Fallback for older cmsg structure
+                data_len_from_xml_str = cmsg.img_length
             
             try:
-                data_len = int(data_len_str)
+                data_len_from_xml = int(data_len_from_xml_str)
+                if data_len_from_xml < 0: data_len_from_xml = 0 # Ensure non-negative
             except ValueError:
-                data_len = 0
+                data_len_from_xml = 0
             
-            if data_len <= 0:
-                 logger.warning(f"[{self.name}] Image length is {data_len} from XML for cmsg {cmsg.msg_id}. Download will proceed; actual size determined by API.")
+            # --- MODIFICATION BLOCK START ---
+            authoritative_total_len = data_len_from_xml # Initial estimate
+            # --- MODIFICATION BLOCK END ---
+
+            if data_len_from_xml <= 0:
+                 logger.warning(f"[{self.name}] Image length is {data_len_from_xml} from XML for cmsg {cmsg.msg_id}. Will attempt to get authoritative length from API.")
 
             chunk_size = 65536
-            num_chunks = (data_len + chunk_size - 1) // chunk_size if data_len > 0 else 1
+            # --- MODIFICATION BLOCK START ---
+            # num_chunks is now an estimate, actual download loop driven by authoritative_total_len or empty chunk
+            num_chunks_estimate = (authoritative_total_len + chunk_size - 1) // chunk_size if authoritative_total_len > 0 else 1
+            logger.info(f"[{self.name}] 开始分段下载图片 (cmsg_id: {cmsg.msg_id}, aeskey: {getattr(cmsg, 'img_aeskey', 'N/A')}) 至: {image_path}，XML预期总大小: {data_len_from_xml if data_len_from_xml > 0 else 'Unknown'} B，预估分 {num_chunks_estimate} 段")
+            # --- MODIFICATION BLOCK END ---
 
-            logger.info(f"[{self.name}] 开始分段下载图片 (cmsg_id: {cmsg.msg_id}, aeskey: {getattr(cmsg, 'img_aeskey', 'N/A')}) 至: {image_path}，预期总大小: {data_len if data_len > 0 else 'Unknown'} B，分 {num_chunks} 段 (approx)")
-
-            # 3. 分块下载逻辑
             all_chunks_data_list = []
-            download_stream_successful = True
+            download_stream_successful = True # Assume success until an error occurs
             actual_downloaded_size = 0
+            
+            # --- MODIFICATION BLOCK START ---
+            current_chunk_index = 0
+            max_chunks_to_try = 2000 # Approx 128MB, safety break for unexpected loops
+            
+            while True:
+                start_pos = actual_downloaded_size
+                current_chunk_size_to_request = chunk_size
 
-            for i in range(num_chunks):
-                start_pos = actual_downloaded_size # Use actual_downloaded_size for start_pos
-                current_chunk_size = chunk_size # Request a full chunk
+                if api_total_len_confirmed and authoritative_total_len >= 0: # If we have an authoritative length
+                    if start_pos >= authoritative_total_len:
+                        logger.info(f"[{self.name}] All data presumed downloaded based on authoritative_total_len ({authoritative_total_len} B) for cmsg {cmsg.msg_id}. Total downloaded: {actual_downloaded_size} B.")
+                        break 
+                    if start_pos + current_chunk_size_to_request > authoritative_total_len:
+                        current_chunk_size_to_request = authoritative_total_len - start_pos
+                    if current_chunk_size_to_request <= 0: # Should mean download is complete
+                        logger.info(f"[{self.name}] Calculated current_chunk_size_to_request <= 0 ({current_chunk_size_to_request} B) with authoritative_total_len. Download complete for cmsg {cmsg.msg_id}.")
+                        break
+                elif current_chunk_index > 0 and authoritative_total_len < 0 and not api_total_len_confirmed:
+                    # If after the first chunk, we still don't have a length, this is an issue.
+                    # Log a warning and proceed, hoping for an empty chunk to terminate.
+                    logger.warning(f"[{self.name}] No authoritative total length after first chunk for cmsg {cmsg.msg_id}. Continuing download, will stop on empty chunk.")
+                    # api_total_len_confirmed could be set to True here to stop trying to get it,
+                    # but we'll let it try once more in case the API returns it later (unlikely).
 
-                # For the last chunk with known data_len, adjust current_chunk_size if needed.
-                if data_len > 0 and (start_pos + chunk_size > data_len):
-                    current_chunk_size = data_len - start_pos
-                
-                if data_len > 0 and current_chunk_size <= 0 and start_pos >= data_len:
-                    logger.info(f"[{self.name}] Presumed all data downloaded for cmsg {cmsg.msg_id}. Total downloaded: {start_pos}, Expected: {data_len}. Breaking chunk loop.")
+                if current_chunk_index >= max_chunks_to_try:
+                    logger.error(f"[{self.name}] Reached max_chunks_to_try ({max_chunks_to_try}) for cmsg {cmsg.msg_id}. Aborting download. Downloaded: {actual_downloaded_size} B.")
+                    download_stream_successful = False
                     break
-                if current_chunk_size <= 0 and data_len > 0: # Should not happen if logic above is correct
-                    logger.warning(f"[{self.name}] Calculated current_chunk_size as {current_chunk_size} for cmsg {cmsg.msg_id}, but data still expected. Breaking.")
-                    download_stream_successful = False; break
-
 
                 params = {
                     "MsgId": int(cmsg.msg_id),
-                    "ToWxid": cmsg.from_user_id, # Sender of the original message
-                    "Wxid": self.wxid, # Bot's WXID
-                    "DataLen": data_len if data_len > 0 else 0, 
+                    "ToWxid": cmsg.from_user_id,
+                    "Wxid": self.wxid,
+                    "DataLen": authoritative_total_len if api_total_len_confirmed and authoritative_total_len >= 0 else 0, # Send 0 if not yet confirmed or unknown
                     "CompressType": 0,
-                    "Section": {"StartPos": start_pos, "DataLen": current_chunk_size}
+                    "Section": {"StartPos": start_pos, "DataLen": current_chunk_size_to_request}
                 }
                 if hasattr(cmsg, 'img_aeskey') and cmsg.img_aeskey:
                     params["Aeskey"] = cmsg.img_aeskey
+            # --- MODIFICATION BLOCK END ---
 
                 api_url = f"http://{api_host}:{api_port}{api_path_prefix}/Tools/DownloadImg"
-                logger.debug(f"[{self.name}] 下载分段 {i+1}/{num_chunks} for cmsg {cmsg.msg_id}: URL={api_url}, Params={params}")
+                # --- MODIFICATION BLOCK START ---
+                logger.debug(f"[{self.name}] 下载分段 {current_chunk_index + 1} (cmsg {cmsg.msg_id}): URL={api_url}, Params={params}")
+                # --- MODIFICATION BLOCK END ---
 
                 try:
                     async with aiohttp.ClientSession() as session:
-                        async with session.post(api_url, json=params, timeout=aiohttp.ClientTimeout(total=30)) as response: # Increased timeout
+                        async with session.post(api_url, json=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
                             if response.status != 200:
                                 full_error_text = await response.text()
-                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 失败, HTTP状态码: {response.status}, Response: {full_error_text[:300]}")
+                                logger.error(f"[{self.name}] 下载分段 {current_chunk_index + 1} (cmsg {cmsg.msg_id}) 失败, HTTP状态码: {response.status}, Response: {full_error_text[:300]}")
                                 download_stream_successful = False; break
                             
                             try:
                                 result = await response.json()
                             except aiohttp.ContentTypeError:
                                 raw_response_text = await response.text()
-                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API Error: Non-JSON response. Status: {response.status}. Response text (first 300 chars): {raw_response_text[:300]}")
+                                logger.error(f"[{self.name}] 下载分段 {current_chunk_index + 1} (cmsg {cmsg.msg_id}) API Error: Non-JSON response. Status: {response.status}. Response text (first 300 chars): {raw_response_text[:300]}")
                                 download_stream_successful = False; break
 
-                            # [MODIFIED START] Enhanced API Response Handling
-                            api_call_succeeded = False
+                            # --- MODIFICATION BLOCK START ---
+                            # Enhanced API Response Handling - Business Layer
+                            api_call_succeeded_business = False # Tracks business logic success (BaseResponse.ret == 0 etc.)
                             error_message_from_api = "Unknown API error"
-
+                            
                             base_response = result.get("BaseResponse")
                             if isinstance(base_response, dict):
                                 api_ret_code = base_response.get("ret")
+                                error_msg_detail = base_response.get("errMsg", {}).get("string", "") if isinstance(base_response.get("errMsg"), dict) else base_response.get("errMsg", "")
                                 if api_ret_code == 0:
-                                    api_call_succeeded = True
-                                    # Even if ret is 0, check overall Success flag if API uses it
-                                    if not result.get("Success", True): # If Success key exists and is False
-                                        api_call_succeeded = False
-                                        error_message_from_api = result.get("Message", base_response.get("errMsg", "API Success=false after BaseResponse.ret=0"))
-                                elif api_ret_code is not None: # ret is present and non-zero
-                                    error_message_from_api = base_response.get("errMsg", f"API error with ret code {api_ret_code}")
-                                    logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API报告错误 (BaseResponse): ret={api_ret_code}, errMsg='{error_message_from_api}'. FullResult: {str(result)[:300]}")
-                                    download_stream_successful = False; break
-                                else: # BaseResponse exists but no 'ret' field, or 'ret' is None. Fallback to 'Success' flag.
-                                    if not result.get("Success", False): # Default to False if Success is missing or explicitly false
-                                        error_message_from_api = result.get("Message", "API Success flag is false and BaseResponse.ret is missing.")
-                                        logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API报告失败 (Success flag after missing BaseResponse.ret): {error_message_from_api}. FullResult: {str(result)[:300]}")
-                                        download_stream_successful = False; break
-                                    else: # BaseResponse without 'ret', but 'Success' is true or missing (implies true)
-                                        api_call_succeeded = True 
-                            else: # No BaseResponse dict, rely solely on "Success" flag
-                                if not result.get("Success", False): # Default to False if Success is missing or explicitly false
-                                    error_message_from_api = result.get("Message", "API Success flag is false and no BaseResponse.")
-                                    logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) API报告失败 (Success flag, no BaseResponse): {error_message_from_api}. FullResult: {str(result)[:300]}")
-                                    download_stream_successful = False; break
-                                else: # No BaseResponse, Success is true or missing (implies true by default for this path)
-                                    api_call_succeeded = True
+                                    api_call_succeeded_business = True
+                                    if not result.get("Success", True): # Overall Success flag might be false
+                                        api_call_succeeded_business = False
+                                        error_message_from_api = result.get("Message", error_msg_detail or "API Success=false after BaseResponse.ret=0")
+                                else: # ret is non-zero or None
+                                    error_message_from_api = error_msg_detail or f"API error with ret code {api_ret_code}"
+                                    logger.error(f"[{self.name}] 下载分段 {current_chunk_index + 1} (cmsg {cmsg.msg_id}) API报告业务错误 (BaseResponse): ret={api_ret_code}, errMsg='{error_message_from_api}'. FullResult: {str(result)[:300]}")
+                                    download_stream_successful = False; break 
+                            elif not result.get("Success", False): # No BaseResponse, rely on overall Success flag
+                                error_message_from_api = result.get("Message", "API Success flag is false and no BaseResponse.")
+                                logger.error(f"[{self.name}] 下载分段 {current_chunk_index + 1} (cmsg {cmsg.msg_id}) API报告失败 (Success flag, no BaseResponse): {error_message_from_api}. FullResult: {str(result)[:300]}")
+                                download_stream_successful = False; break
+                            else: # No BaseResponse, Success is true or missing (implies true)
+                                api_call_succeeded_business = True
 
-                            if not api_call_succeeded: # This should ideally be caught by breaks above, but serves as a final safeguard.
-                                # Log if somehow this state is reached without a break.
-                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 最终判断为API调用失败. Message: {error_message_from_api}. FullResult: {str(result)[:300]}\")")
+                            if not api_call_succeeded_business: # Safeguard break
+                                logger.error(f"[{self.name}] 下载分段 {current_chunk_index + 1} (cmsg {cmsg.msg_id}) 最终判断为API业务调用失败. Message: {error_message_from_api}. FullResult: {str(result)[:300]}")
                                 download_stream_successful = False; break
                             
-                            # Proceed with chunk_base64 extraction only if api_call_succeeded
+                            # Try to get authoritative totalLen if not yet confirmed
+                            if not api_total_len_confirmed:
+                                data_payload_for_len = result.get("Data")
+                                if isinstance(data_payload_for_len, dict):
+                                    api_reported_len_str = data_payload_for_len.get("totalLen") # API often uses totalLen
+                                    if api_reported_len_str is not None: # Can be 0
+                                        try:
+                                            api_reported_len = int(api_reported_len_str)
+                                            if api_reported_len >= 0:
+                                                logger.info(f"[{self.name}] API reported totalLen: {api_reported_len} B for cmsg {cmsg.msg_id}. XML was: {data_len_from_xml} B.")
+                                                authoritative_total_len = api_reported_len
+                                                api_total_len_confirmed = True
+                                                num_chunks_estimate = (authoritative_total_len + chunk_size - 1) // chunk_size if authoritative_total_len > 0 else 1 # Re-estimate for logging
+                                                # If API returns totalLen 0, and it's the first chunk, this might be an empty image
+                                                if authoritative_total_len == 0 and current_chunk_index == 0:
+                                                    logger.info(f"[{self.name}] API confirmed totalLen=0 for cmsg {cmsg.msg_id} on first chunk.")
+                                            else:
+                                                logger.warning(f"[{self.name}] API reported invalid negative totalLen: {api_reported_len} for cmsg {cmsg.msg_id}. Ignoring.")
+                                        except ValueError:
+                                            logger.warning(f"[{self.name}] API reported non-integer totalLen: '{api_reported_len_str}' for cmsg {cmsg.msg_id}. Ignoring.")
+                                    else: # totalLen not in Data payload
+                                        logger.info(f"[{self.name}] API response for cmsg {cmsg.msg_id} did not contain 'totalLen' in 'Data' payload on chunk {current_chunk_index + 1}. Original XML length {data_len_from_xml} will be used if positive.")
+                                else: # Data payload not a dict
+                                    logger.info(f"[{self.name}] API response 'Data' field is not a dictionary for cmsg {cmsg.msg_id}. Cannot get totalLen. Original XML length {data_len_from_xml} will be used if positive.")
+                                
+                                if not api_total_len_confirmed and current_chunk_index == 0: # If still not confirmed after first chunk
+                                    logger.warning(f"[{self.name}] Failed to get authoritative totalLen from API's first chunk response for cmsg {cmsg.msg_id}. Will rely on XML length ({data_len_from_xml} B) if >0, or stop on empty chunk.")
+                                    api_total_len_confirmed = True # Stop trying to get it, use XML or empty chunk logic
+
                             chunk_base64 = None
-                            # Try to get data from a common "Data" wrapper first
-                            data_payload = result.get("Data") # Use .get() to avoid KeyError if "Data" is not present
-                            
-                            if isinstance(data_payload, dict) and data_payload: # Check if data_payload is a non-empty dict
+                            data_payload = result.get("Data")
+                            if isinstance(data_payload, dict):
                                 if "buffer" in data_payload and isinstance(data_payload["buffer"], (str, bytes)):
                                     chunk_base64 = data_payload["buffer"]
                                 elif "data" in data_payload and isinstance(data_payload.get("data"), dict) and \
                                      "buffer" in data_payload["data"] and isinstance(data_payload["data"]["buffer"], (str, bytes)):
                                     chunk_base64 = data_payload["data"]["buffer"]
-                                else: # Check other common fields within data_payload dict
-                                    for field in ["Chunk", "Image", "Base64Data", "fileData"]:
-                                        potential_data_in_payload = data_payload.get(field)
-                                        if isinstance(potential_data_in_payload, (str, bytes)) and potential_data_in_payload:
-                                            chunk_base64 = potential_data_in_payload; break
                             elif isinstance(data_payload, str) and data_payload: # "Data" field itself is a base64 string
                                 chunk_base64 = data_payload
                             
-                            # Fallback: If not found in "Data" payload or "Data" was not a string, check root level fields
-                            if not chunk_base64:
-                                for field in ["data", "fileData", "Image", "base64Data", "buffer", "chunk"]: # Common root level fields
+                            if not chunk_base64: # Fallback if not in "Data"
+                                for field in ["data", "buffer", "chunk"]:
                                     potential_data_at_root = result.get(field)
-                                    if isinstance(potential_data_at_root, (str, bytes)) and potential_data_at_root: # Must be string/bytes and not empty
+                                    if isinstance(potential_data_at_root, (str, bytes)) and potential_data_at_root:
                                         chunk_base64 = potential_data_at_root; break
                             
-                            if not chunk_base64:
-                                logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 成功获取API响应但未能提取到有效的图片数据字符串/字节. Response: {str(result)[:300]}")
-                                # If API reported success but no data for the first chunk of an unknown length download, it might be an empty image.
-                                if data_len == 0 and i == 0:
-                                    logger.info(f"[{self.name}] API reported success but no data for first chunk (unknown length) for cmsg {cmsg.msg_id}. Assuming empty image or end of stream.")
-                                    # download_stream_successful can remain true, let it try to finalize as empty.
+                            if not chunk_base64: # Still no data
+                                # If authoritative_total_len is 0 and confirmed, and this is the first chunk, it's a valid empty image.
+                                if api_total_len_confirmed and authoritative_total_len == 0 and current_chunk_index == 0:
+                                    logger.info(f"[{self.name}] API confirmed totalLen=0 and returned no data for first chunk of cmsg {cmsg.msg_id}. Valid empty image.")
+                                    download_stream_successful = True # Mark as success for empty image
+                                    break # Exit loop, all_chunks_data_list will be empty.
                                 else:
-                                     download_stream_successful = False # Mark as failure if data was expected
-                                break 
-                            # [MODIFIED END]
+                                    logger.error(f"[{self.name}] 下载分段 {current_chunk_index + 1} (cmsg {cmsg.msg_id}) 成功获取API响应但未能提取到有效图片数据. Response: {str(result)[:300]}")
+                                    download_stream_successful = False
+                                break
+                            # --- MODIFICATION BLOCK END ---
                             
                             try:
-                                if isinstance(chunk_base64, bytes): # If API directly returns bytes
+                                if isinstance(chunk_base64, bytes):
                                     chunk_data_bytes = chunk_base64
                                 elif isinstance(chunk_base64, str):
                                     clean_base64 = chunk_base64.strip()
@@ -2186,128 +2234,139 @@ class WX849Channel(ChatChannel):
                                     clean_base64 += '=' * padding_needed
                                     chunk_data_bytes = base64.b64decode(clean_base64)
                                 else:
-                                    # This path should not be reached if the extraction logic above correctly ensures chunk_base64 is str or bytes.
                                     logger.error(f"[{self.name}] 逻辑错误: chunk_base64 在解码前既不是字符串也不是字节. Type: {type(chunk_base64)}. Value: {str(chunk_base64)[:100]}")
-                                    # This indicates a flaw in the success checking or data extraction logic if it reaches here with a dict.
-                                    download_stream_successful = False; break # Treat as critical logic failure.
+                                    download_stream_successful = False; break
 
-                                if not chunk_data_bytes and data_len == 0 and i == 0:
-                                    logger.info(f"[{self.name}] API returned empty decoded data for chunk 1 (unknown length) for cmsg {cmsg.msg_id}. Download stream ended.")
-                                    # download_stream_successful can remain true, all_chunks_data_list will be empty.
-                                    break # Break here, as there's no more data.
+                                # --- MODIFICATION BLOCK START ---
+                                if not chunk_data_bytes:
+                                    # If authoritative_total_len confirmed and > 0, an empty chunk here might be an error or premature end.
+                                    if api_total_len_confirmed and authoritative_total_len > 0 and actual_downloaded_size < authoritative_total_len:
+                                        logger.warning(f"[{self.name}] Decoded empty chunk {current_chunk_index + 1} for cmsg {cmsg.msg_id} but expected more data (got {actual_downloaded_size}/{authoritative_total_len} B). Assuming end of stream.")
+                                    # If authoritative_total_len is unknown (-1) or 0 (and confirmed), an empty chunk means end of data.
+                                    elif (authoritative_total_len < 0 or (api_total_len_confirmed and authoritative_total_len == 0)):
+                                        logger.info(f"[{self.name}] Decoded empty chunk {current_chunk_index + 1} for cmsg {cmsg.msg_id} (authoritative_total_len: {authoritative_total_len}). Download stream ended.")
+                                    # Else: (e.g. authoritative_total_len > 0 but not confirmed, or some other edge case)
+                                    # This might be an unexpected empty chunk. The outer loop break conditions will handle it.
+                                    # download_stream_successful remains true for now, subsequent verification will fail if incomplete.
+                                    break # Break here, as there's no more data in this chunk.
                                 
-                                if not chunk_data_bytes and data_len > 0:
-                                     logger.warning(f"[{self.name}] Decoded empty chunk {i+1}/{num_chunks} for cmsg {cmsg.msg_id} but expected data.")
-                                     # This might be an error or end of data if DataLen was an estimate.
-                                     # If API guarantees non-empty chunks until the end, this is an error.
-                                     # For now, we'll let it proceed, but it might lead to a smaller file.
-                                
-                                if chunk_data_bytes: # Only append if there's actual data
+                                if chunk_data_bytes:
                                     all_chunks_data_list.append(chunk_data_bytes)
                                     actual_downloaded_size += len(chunk_data_bytes)
-                                    logger.debug(f"[{self.name}] 第 {i+1}/{num_chunks} (cmsg {cmsg.msg_id}) 段解码成功，大小: {len(chunk_data_bytes)} B. Total so far: {actual_downloaded_size} B")
-                                else: # No data, but no explicit error from API (e.g. first chunk of unknown length returned empty)
-                                    if data_len == 0 and i == 0: # Explicitly break if first chunk for unknown length is empty
-                                        break
-
+                                    logger.debug(f"[{self.name}] 第 {current_chunk_index + 1} (cmsg {cmsg.msg_id}) 段解码成功，大小: {len(chunk_data_bytes)} B. Total so far: {actual_downloaded_size} B / {authoritative_total_len if authoritative_total_len >=0 else 'Unknown'} B")
+                                # --- MODIFICATION BLOCK END ---
 
                             except Exception as decode_err:
-                                logger.error(f"[{self.name}] 第 {i+1}/{num_chunks} (cmsg {cmsg.msg_id}) 段Base64解码或处理失败: {decode_err}. Data (头100): {str(chunk_base64)[:100]}")
+                                logger.error(f"[{self.name}] 第 {current_chunk_index + 1} (cmsg {cmsg.msg_id}) 段Base64解码或处理失败: {decode_err}. Data (头100): {str(chunk_base64)[:100]}")
                                 download_stream_successful = False; break
                 except asyncio.TimeoutError:
-                    logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 超时。")
+                    logger.error(f"[{self.name}] 下载分段 {current_chunk_index + 1} (cmsg {cmsg.msg_id}) 超时。")
                     download_stream_successful = False; break
                 except Exception as api_err:
-                    logger.error(f"[{self.name}] 下载分段 {i+1} (cmsg {cmsg.msg_id}) 发生API调用错误: {api_err}\n{traceback.format_exc()}")
+                    logger.error(f"[{self.name}] 下载分段 {current_chunk_index + 1} (cmsg {cmsg.msg_id}) 发生API调用错误: {api_err}\\n{traceback.format_exc()}")
                     download_stream_successful = False; break
+                
+                # --- MODIFICATION BLOCK START ---
+                current_chunk_index += 1
+                # Check again if download should complete based on authoritative length
+                if api_total_len_confirmed and authoritative_total_len >= 0 and actual_downloaded_size >= authoritative_total_len:
+                    logger.info(f"[{self.name}] Downloaded size ({actual_downloaded_size} B) meets or exceeds authoritative_total_len ({authoritative_total_len} B) for cmsg {cmsg.msg_id}. Finalizing.")
+                    break
+                # --- MODIFICATION BLOCK END ---
             
             # 4. 数据写入、刷新与同步
             file_written_successfully = False
-            if download_stream_successful and all_chunks_data_list: # Ensure there's data to write
+            if download_stream_successful and all_chunks_data_list: 
                 try:
-                    # Write to the target image_path (e.g., CACHE_DIR/AESKEY.tmp)
                     with open(image_path, "wb") as f_write:
                         for chunk_piece in all_chunks_data_list:
                             f_write.write(chunk_piece)
                         f_write.flush()
                         if hasattr(os, 'fsync'):
                             try: os.fsync(f_write.fileno())
-                            except OSError: pass # Ignore fsync errors on some systems like Windows
+                            except OSError: pass 
                     
                     final_size_on_disk = os.path.getsize(image_path)
                     logger.info(f"[{self.name}] 所有分块成功写入并刷新到磁盘: {image_path}, 实际大小: {final_size_on_disk} B (Downloaded: {actual_downloaded_size} B)")
                     if final_size_on_disk == 0 and actual_downloaded_size > 0 :
                         logger.error(f"[{self.name}] 警告：数据已下载 ({actual_downloaded_size}B) 但写入文件后大小为0！Path: {image_path}")
-                        # This is a critical error, file write failed despite no IO Exception.
                         file_written_successfully = False
                     elif final_size_on_disk == 0 and actual_downloaded_size == 0:
                         logger.info(f"[{self.name}] 下载完成，但未收到任何数据且文件大小为0 (可能为空图片或API指示无内容): {image_path}")
-                        # This might be acceptable for an empty image. PIL check will confirm.
                         file_written_successfully = True 
+                    # --- MODIFICATION BLOCK START ---
+                    elif api_total_len_confirmed and authoritative_total_len > 0 and final_size_on_disk < authoritative_total_len:
+                        logger.warning(f"[{self.name}] 文件写入完成 ({final_size_on_disk} B), 但小于API报告的总长度 ({authoritative_total_len} B) for cmsg {cmsg.msg_id}. Path: {image_path}")
+                        # Potentially still successful if server sent less data than initially stated but indicated end-of-stream
+                        file_written_successfully = True # Let PIL verification decide
+                    # --- MODIFICATION BLOCK END ---
                     else:
                         file_written_successfully = True
 
                 except IOError as io_err_write:
                     logger.error(f"[{self.name}] 写入或刷新图片文件失败: {io_err_write}, Path: {image_path}")
                 except Exception as e_write:
-                    logger.error(f"[{self.name}] 写入文件时发生未知错误: {e_write}, Path: {image_path}\n{traceback.format_exc()}")
+                    logger.error(f"[{self.name}] 写入文件时发生未知错误: {e_write}, Path: {image_path}\\n{traceback.format_exc()}")
 
             elif not all_chunks_data_list and download_stream_successful:
                 logger.warning(f"[{self.name}] 所有分块下载API调用成功，但未收集到任何数据块 for {image_path}. 文件将为空或不存在。")
-                # Consider this a failure unless an empty image is valid.
-                if os.path.exists(image_path) and os.path.getsize(image_path) == 0:
-                    file_written_successfully = True # Empty file was "successfully" written.
-                else: # No file or data
-                    download_stream_successful = False # Mark as failure for subsequent checks
+                # This case covers when API confirms totalLen=0 and returns no data for first chunk.
+                if api_total_len_confirmed and authoritative_total_len == 0:
+                    logger.info(f"[{self.name}] Confirmed empty image (totalLen=0 from API) for cmsg {cmsg.msg_id}, path {image_path}")
+                    # Create an empty file to satisfy PIL check for empty image.
+                    try:
+                        open(image_path, 'w').close()
+                        file_written_successfully = True
+                    except IOError as e_io_empty:
+                        logger.error(f"[{self.name}] Failed to create placeholder empty file {image_path}: {e_io_empty}")
+                        download_stream_successful = False # Cannot proceed with empty file logic
+                elif os.path.exists(image_path) and os.path.getsize(image_path) == 0: # Should not be reached if above handles totalLen=0
+                    file_written_successfully = True 
+                else: 
+                    download_stream_successful = False
 
-
-            # 5. 图片验证阶段 和 重命名 (if image_path was .tmp)
+            # 5. 图片验证阶段 和 重命名
             final_verified_path = None
-            if file_written_successfully:
+            if file_written_successfully: #Proceed to verification only if file write attempt was considered successful
                 await asyncio.sleep(0.1) 
                 try:
                     if os.path.getsize(image_path) == 0:
-                        # Accept empty files if no data was ever downloaded, otherwise it's an error.
-                        if actual_downloaded_size == 0:
-                            logger.info(f"[{self.name}] Downloaded image file is empty (0 bytes), and 0 bytes were downloaded. Assuming valid empty image: {image_path}")
-                             # MODIFICATION START: Handle renaming for empty image using aeskey
+                        if actual_downloaded_size == 0 and (api_total_len_confirmed and authoritative_total_len == 0): # Explicitly confirmed empty
+                            logger.info(f"[{self.name}] Downloaded image file is empty (0 bytes), and 0 bytes were downloaded. API confirmed empty. Valid empty image: {image_path}")
                             if hasattr(cmsg, 'img_aeskey') and cmsg.img_aeskey:
-                                final_filename_empty_aeskey = f"{cmsg.img_aeskey}.empty" # Or just aeskey if no ext desired for empty
+                                final_filename_empty_aeskey = f"{cmsg.img_aeskey}.empty"
                                 final_empty_path_aeskey = os.path.join(target_dir, final_filename_empty_aeskey)
                                 try:
                                     if os.path.exists(final_empty_path_aeskey) and final_empty_path_aeskey != image_path: 
                                         os.remove(final_empty_path_aeskey)
-                                    os.rename(image_path, final_empty_path_aeskey)
+                                    shutil.move(image_path, final_empty_path_aeskey) # Use shutil.move for robustness
                                     logger.info(f"[{self.name}] Renamed empty image from {image_path} to {final_empty_path_aeskey} using aeskey.")
                                     final_verified_path = final_empty_path_aeskey
-                                except OSError as e_rename_empty_aes:
+                                except (OSError, shutil.Error) as e_rename_empty_aes:
                                     logger.error(f"[{self.name}] Failed to rename empty image {image_path} to use aeskey: {e_rename_empty_aes}")
-                                    final_verified_path = image_path # Fallback to original path
-                            else: # No aeskey for empty image
+                                    final_verified_path = image_path 
+                            else:
                                 logger.warning(f"[{self.name}] Empty image downloaded but no cmsg.img_aeskey available for msg {cmsg.msg_id}. Keeping original path: {image_path}")
                                 final_verified_path = image_path
-                            # MODIFICATION END
-                            # Set cmsg for empty image
+                            
                             cmsg.image_path = final_verified_path
                             cmsg.content = final_verified_path 
                             cmsg.ctype = ContextType.IMAGE 
                             cmsg._prepared = True
-                            return True # Successfully "downloaded" an empty image
-                        else: # Size is 0 but data *was* downloaded - this is an error.
-                            raise UnidentifiedImageError("Downloaded image file is empty despite data being received.")
+                            return True 
+                        else: 
+                            raise UnidentifiedImageError("Downloaded image file is empty despite data being received or API not confirming empty.")
 
-                    # Proceed with PIL verification for non-empty files
                     with open(image_path, "rb") as f_read_verify: image_bytes_for_verify = f_read_verify.read()
                     if not image_bytes_for_verify: raise UnidentifiedImageError("Downloaded image file read as empty for verification.")
 
                     with Image.open(BytesIO(image_bytes_for_verify)) as img:
-                        img_format_detected = img.format # This is from PIL
-                        img_size = img.size
-                    logger.info(f"[{self.name}] 图片(cmsg {cmsg.msg_id})验证成功 (PIL): 格式={img_format_detected}, 大小={img_size}, 初始路径={image_path}")
+                        img_format_detected = img.format 
+                        img_size_pil = img.size # Renamed to avoid conflict with os.path.getsize
+                    logger.info(f"[{self.name}] 图片(cmsg {cmsg.msg_id})验证成功 (PIL): 格式={img_format_detected}, 大小={img_size_pil}, 初始路径={image_path}")
 
-                    # Determine actual extension using imghdr for more reliability for file system
-                    import imghdr # Ensure imported
-                    actual_ext_imghdr = imghdr.what(None, h=image_bytes_for_verify) # Pass bytes directly
+                    import imghdr 
+                    actual_ext_imghdr = imghdr.what(None, h=image_bytes_for_verify) 
                     
                     if actual_ext_imghdr:
                         actual_ext = actual_ext_imghdr.lower()
@@ -2321,24 +2380,22 @@ class WX849Channel(ChatChannel):
                         actual_ext = "jpg" 
                         logger.warning(f"[{self.name}] Could not determine image type via PIL or imghdr for cmsg {cmsg.msg_id}. Defaulting to '.jpg'.")
 
-                    # MODIFICATION START: Rename to use aeskey
                     if hasattr(cmsg, 'img_aeskey') and cmsg.img_aeskey:
                         final_filename_aeskey = f"{cmsg.img_aeskey}.{actual_ext}"
                         final_new_path_aeskey = os.path.join(target_dir, final_filename_aeskey)
                         try:
                             if os.path.exists(final_new_path_aeskey) and final_new_path_aeskey != image_path:
                                 os.remove(final_new_path_aeskey) 
-                            os.rename(image_path, final_new_path_aeskey) # image_path is img_{msg_id}_{timestamp}.jpg
+                            shutil.move(image_path, final_new_path_aeskey) # Use shutil.move
                             logger.info(f"[{self.name}] Renamed cached image from {image_path} to {final_new_path_aeskey} using aeskey.")
                             final_verified_path = final_new_path_aeskey
-                        except OSError as e_rename_aes:
+                        except (OSError, shutil.Error) as e_rename_aes:
                             logger.error(f"[{self.name}] Failed to rename cached image {image_path} to use aeskey {final_new_path_aeskey}: {e_rename_aes}. Using original path.")
                             final_verified_path = image_path 
-                    else: # No aeskey, keep original name (img_{msg_id}_{timestamp}.jpg)
+                    else: 
                         logger.warning(f"[{self.name}] No cmsg.img_aeskey found for msg {cmsg.msg_id}. Keeping original cache name: {image_path}")
                         final_verified_path = image_path 
-                    # MODIFICATION END
-
+                    
                     cmsg.image_path = final_verified_path
                     cmsg.content = final_verified_path 
                     cmsg.ctype = ContextType.IMAGE
@@ -2353,23 +2410,21 @@ class WX849Channel(ChatChannel):
                     fsize = os.path.getsize(image_path) if os.path.exists(image_path) else 0
                     if fsize > 100: 
                         logger.info(f"[{self.name}] 图片下载完成 (无严格验证，大小: {fsize}B)，路径: {image_path}")
-                        # MODIFICATION START: Basic rename if no PIL and aeskey exists
                         if hasattr(cmsg, 'img_aeskey') and cmsg.img_aeskey:
-                            final_name_no_pil_aes = f"{cmsg.img_aeskey}.jpg" # Default to jpg
+                            final_name_no_pil_aes = f"{cmsg.img_aeskey}.jpg" 
                             final_new_path_no_pil_aes = os.path.join(target_dir, final_name_no_pil_aes)
                             try:
                                 if os.path.exists(final_new_path_no_pil_aes) and final_new_path_no_pil_aes != image_path: 
                                     os.remove(final_new_path_no_pil_aes)
-                                os.rename(image_path, final_new_path_no_pil_aes)
+                                shutil.move(image_path, final_new_path_no_pil_aes) # Use shutil.move
                                 final_verified_path = final_new_path_no_pil_aes
                                 logger.info(f"[{self.name}] Renamed (no PIL) cached image from {image_path} to {final_verified_path} using aeskey.")
-                            except OSError: 
+                            except (OSError, shutil.Error): 
                                 final_verified_path = image_path
                                 logger.error(f"[{self.name}] Failed to rename (no PIL) cached image {image_path} to use aeskey. Keeping original.")
                         else: 
                             final_verified_path = image_path
                             logger.warning(f"[{self.name}] No PIL and no aeskey. Keeping original name (no PIL): {image_path}")
-                        # MODIFICATION END
                         
                         cmsg.image_path = final_verified_path
                         cmsg.content = final_verified_path
@@ -2380,10 +2435,9 @@ class WX849Channel(ChatChannel):
                         logger.warning(f"[{self.name}] 无严格验证且文件大小 ({fsize}B) 过小/为0，视为无效: {image_path}")
                         if os.path.exists(image_path): os.remove(image_path)
                 except Exception as pil_verify_err: 
-                    logger.error(f"[{self.name}] 图片验证时发生未知错误 for cmsg {cmsg.msg_id}: {pil_verify_err}, 文件: {image_path}\n{traceback.format_exc()}")
+                    logger.error(f"[{self.name}] 图片验证时发生未知错误 for cmsg {cmsg.msg_id}: {pil_verify_err}, 文件: {image_path}\\n{traceback.format_exc()}")
                     if os.path.exists(image_path): os.remove(image_path)
             
-            # 6. 最终失败路径
             logger.error(f"[{self.name}] 图片下载或验证未能成功 for cmsg {cmsg.msg_id} (Path: {image_path}). download_stream_ok={download_stream_successful}, file_written_ok={file_written_successfully}, data_collected={bool(all_chunks_data_list)}.")
             if os.path.exists(image_path):
                 try: os.remove(image_path); logger.info(f"[{self.name}] 已删除下载失败或验证失败的图片文件: {image_path}")
@@ -2393,13 +2447,14 @@ class WX849Channel(ChatChannel):
             return False
 
         except Exception as outer_e: 
-            logger.critical(f"[{self.name}] _download_image_by_chunks 发生严重意外错误 for cmsg {cmsg.msg_id}, path {image_path if 'image_path' in locals() else 'Unknown'}: {outer_e}\n{traceback.format_exc()}")
+            logger.critical(f"[{self.name}] _download_image_by_chunks 发生严重意外错误 for cmsg {cmsg.msg_id}, path {image_path if 'image_path' in locals() else 'Unknown'}: {outer_e}\\n{traceback.format_exc()}")
             path_to_clean = image_path if 'image_path' in locals() and os.path.exists(image_path) else None
             if path_to_clean:
                 try: os.remove(path_to_clean); logger.info(f"[{self.name}] 意外错误后，已尝试删除图片文件: {path_to_clean}")
                 except Exception as e_rm_outer: logger.error(f"[{self.name}] 意外错误后，删除图片文件失败: {e_rm_outer}")
             if cmsg: cmsg._prepared = False
             return False
+# MODIFIED_LINES_END
         
     async def _download_image_with_details(self, image_meta: dict, target_path: str) -> bool:
         """

@@ -1,5 +1,7 @@
 from bot.session_manager import Session
 from common.log import logger
+import tiktoken
+import json
 
 
 class OpenAISession(Session):
@@ -9,24 +11,17 @@ class OpenAISession(Session):
         self.reset()
 
     def __str__(self):
-        # 构造对话模型的输入
-        """
-        e.g.  Q: xxx
-              A: xxx
-              Q: xxx
-        """
-        prompt = ""
-        for item in self.messages:
-            if item["role"] == "system":
-                prompt += item["content"] + "<|endoftext|>\n\n\n"
-            elif item["role"] == "user":
-                prompt += "Q: " + item["content"] + "\n"
-            elif item["role"] == "assistant":
-                prompt += "\n\nA: " + item["content"] + "<|endoftext|>\n"
+        """返回格式化的对话历史字符串，用于日志记录"""
+        formatted_messages = []
+        for msg in self.messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            formatted_messages.append(f"{role}: {content}")
+        return "\n".join(formatted_messages)
 
-        if len(self.messages) > 0 and self.messages[-1]["role"] == "user":
-            prompt += "A: "
-        return prompt
+    def get_messages(self):
+        """返回原始消息列表，用于 API 调用"""
+        return self.messages
 
     def discard_exceeding(self, max_tokens, cur_tokens=None):
         precise = True
@@ -60,14 +55,23 @@ class OpenAISession(Session):
         return cur_tokens
 
     def calc_tokens(self):
-        return num_tokens_from_string(str(self), self.model)
+        return num_tokens_from_messages(self.messages, self.model)
 
 
-# refer to https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
-def num_tokens_from_string(string: str, model: str) -> int:
-    """Returns the number of tokens in a text string."""
-    import tiktoken
+def num_tokens_from_messages(messages, model: str) -> int:
+    """Returns the number of tokens used by a list of messages."""
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")  # 使用通用的编码器
+    except Exception as e:
+        logger.warn(f"Failed to get encoding: {e}")
+        return len(str(messages))  # 如果获取编码器失败，返回字符串长度作为估计
 
-    encoding = tiktoken.encoding_for_model(model)
-    num_tokens = len(encoding.encode(string, disallowed_special=()))
+    num_tokens = 0
+    for message in messages:
+        num_tokens += 4  # 每条消息的额外标记
+        for key, value in message.items():
+            num_tokens += len(encoding.encode(value))
+            if key == "name":  # 如果有名字字段，额外加1
+                num_tokens += 1
+    num_tokens += 2  # 回复以 assistant 开头
     return num_tokens

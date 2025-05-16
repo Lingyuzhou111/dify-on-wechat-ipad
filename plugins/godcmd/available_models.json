@@ -1,0 +1,48 @@
+{
+    "openai": [
+        "o1-mini",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-4o-mini",
+        "gpt-4o-mini-search-preview"
+        ],
+    "dashscope": [
+        "qwen-plus",
+        "qwen-max",
+        "qwen-turbo-2025-04-28",
+        "qwen3-235b-a22b",
+        "qwen3-32b",
+        "qwen3-14b",
+        "qwq-plus",
+        "deepseek-v3",
+        "deepseek-r1"
+        ],
+    "zhipuai": [
+        "glm-4-flash-250414",
+        "glm-z1-flash",
+        "glm-4v-flash",
+        "glm-4-plus"
+        ],
+    "deepseek": [
+        "deepseek-chat",
+        "deepseek-reasoner"
+        ],
+    "siliconflow": [
+        "deepseek-ai/DeepSeek-V3",
+        "deepseek-ai/DeepSeek-R1",
+        "THUDM/GLM-4-9B-0414",
+        "THUDM/GLM-Z1-9B-0414",
+        "THUDM/GLM-Z1-Rumination-32B-0414",
+        "Qwen/Qwen2.5-7B-Instruct"
+        ],
+    "dify": [
+        "chatflow",
+        "workflow",
+        "chatbot",
+        "agent"
+        ],
+    "coze": [
+        "coze"
+        ]
+    }

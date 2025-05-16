@@ -65,6 +65,10 @@ COMMANDS = {
         "alias": ["reset", "重置会话"],
         "desc": "重置会话",
     },
+    "modellist": {
+        "alias": ["modellist", "模型列表"],
+        "desc": "显示可用的AI模型列表",
+    }
 }
 
 ADMIN_COMMANDS = {
@@ -361,6 +365,29 @@ class Godcmd(Plugin):
                     else:
                         ok, result = False, "当前对话机器人不支持重置会话"
                 logger.debug("[Godcmd] command: %s by %s" % (cmd, user))
+                elif canonical_cmd == "modellist":
+                    try:
+                        models_file_path = os.path.join(os.path.dirname(__file__), "available_models.json")
+                        if not os.path.exists(models_file_path):
+                            ok, result = False, "错误：available_models.json 文件未找到。"
+                        else:
+                            with open(models_file_path, "r", encoding="utf-8") as f:
+                                models_data = json.load(f)
+                            
+                            reply_content = "当前可用模型列表：\n"
+                            count = 1
+                            for category, models in models_data.items():
+                                reply_content += f"\n{count}.{category}系列\n"
+                                for model_name in models:
+                                    reply_content += f"{model_name}\n"
+                                count += 1
+                            ok, result = True, reply_content.strip()
+                    except json.JSONDecodeError:
+                        ok, result = False, "错误：解析 available_models.json 文件失败，请检查JSON格式。"
+                    except Exception as e:
+                        logger.error(f"[Godcmd] Error processing modellist: {e}")
+                        ok, result = False, f"处理 #modellist 指令时发生内部错误: {str(e)[:100]}"
+                logger.debug("[Godcmd] command: %s by %s" % (canonical_cmd, user))
             elif any(cmd in info["alias"] for info in ADMIN_COMMANDS.values()):
                 if isadmin:
                     if isgroup:

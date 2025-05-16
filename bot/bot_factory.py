@@ -67,7 +67,19 @@ def create_bot(bot_type):
     ] or bot_type == const.DIFY:
         from bot.dify.dify_bot import DifyBot
         return DifyBot()
-        
+
+    # 如果模型是 OpenAI 系列模型，使用 OpenAIBot
+    if model in [
+        const.O1_MINI,
+        const.GPT_41,
+        const.GPT_41_MINI,
+        const.GPT_41_NANO,
+        const.GPT_4O_MINI,
+        const.GPT_4O_MINI_SEARCH        
+    ]:
+        from bot.openai.open_ai_bot import OpenAIBot
+        return OpenAIBot()
+
     # 其他模型的处理逻辑
     if bot_type == const.BAIDU:
         from bot.baidu.baidu_wenxin import BaiduWenxinBot
@@ -77,11 +89,6 @@ def create_bot(bot_type):
         # ChatGPT 网页端web接口
         from bot.chatgpt.chat_gpt_bot import ChatGPTBot
         return ChatGPTBot()
-
-    elif bot_type == const.OPEN_AI:
-        # OpenAI 官方对话模型API
-        from bot.openai.open_ai_bot import OpenAIBot
-        return OpenAIBot()
 
     elif bot_type == const.CHATGPTONAZURE:
         # Azure chatgpt service

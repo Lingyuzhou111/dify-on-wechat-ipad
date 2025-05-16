@@ -1,6 +1,7 @@
 # encoding:utf-8
 
 import time
+import pkg_resources
 
 import openai
 import openai.error
@@ -21,24 +22,44 @@ user_session = dict()
 class OpenAIBot(Bot, OpenAIImage):
     def __init__(self):
         super().__init__()
-        openai.api_key = conf().get("open_ai_api_key")
-        if conf().get("open_ai_api_base"):
-            openai.api_base = conf().get("open_ai_api_base")
+        api_key = conf().get("open_ai_api_key")
+        api_base = conf().get("open_ai_api_base", "https://vip.apiyi.com/v1")
+        if api_base.endswith("/"):
+            api_base = api_base[:-1]
+        
+        # 检查 openai 包版本
+        try:
+            openai_version = pkg_resources.get_distribution("openai").version
+            if openai_version >= "1.0.0":
+                from openai import OpenAI
+                self.client = OpenAI(
+                    api_key=api_key,
+                    base_url=api_base
+                )
+            else:
+                # 使用旧版本的配置方式
+                openai.api_key = api_key
+                openai.api_base = api_base
+                self.client = None
+        except Exception as e:
+            logger.warn(f"Failed to check openai version: {e}")
+            # 使用旧版本的配置方式
+            openai.api_key = api_key
+            openai.api_base = api_base
+            self.client = None
+        
         proxy = conf().get("proxy")
         if proxy:
-            openai.proxy = proxy
+            if self.client:
+                self.client.proxy = proxy
+            else:
+                openai.proxy = proxy
 
-        self.sessions = SessionManager(OpenAISession, model=conf().get("model") or "text-davinci-003")
+        self.sessions = SessionManager(OpenAISession, model=conf().get("model") or "gpt-4o-mini-search-preview")
         self.args = {
-            "model": conf().get("model") or "text-davinci-003",  # 对话模型的名称
-            "temperature": conf().get("temperature", 0.9),  # 值在[0,1]之间，越大表示回复越具有不确定性
+            "model": conf().get("model") or "gpt-4o-mini-search-preview",  # 对话模型的名称
             "max_tokens": 1200,  # 回复最大的字符数
-            "top_p": 1,
-            "frequency_penalty": conf().get("frequency_penalty", 0.0),  # [-2,2]之间，该值越大则更倾向于产生不同的内容
-            "presence_penalty": conf().get("presence_penalty", 0.0),  # [-2,2]之间，该值越大则更倾向于产生不同的内容
-            "request_timeout": conf().get("request_timeout", None),  # 请求超时时间，openai接口默认设置为600，对于难问题一般需要较长时间
-            "timeout": conf().get("request_timeout", None),  # 重试超时时间，在这个时间内，将会自动重试
-            "stop": ["\n\n\n"],
+            "request_timeout": conf().get("request_timeout", None),  # 请求超时时间
         }
 
     def reply(self, query, context=None):
@@ -83,10 +104,37 @@ class OpenAIBot(Bot, OpenAIImage):
 
     def reply_text(self, session: OpenAISession, retry_count=0):
         try:
-            response = openai.Completion.create(prompt=str(session), **self.args)
-            res_content = response.choices[0]["text"].strip().replace("<|endoftext|>", "")
-            total_tokens = response["usage"]["total_tokens"]
-            completion_tokens = response["usage"]["completion_tokens"]
+            # 确保消息列表包含系统提示
+            messages = session.get_messages()
+            if not any(msg["role"] == "system" for msg in messages):
+                messages.insert(0, {
+                    "role": "system",
+                    "content": "你是一个拥有联网搜索能力的助手，能够提供最新信息。"
+                })
+
+            if self.client:
+                # 使用新版本的 API 调用方式
+                response = self.client.chat.completions.create(
+                    model=self.args["model"],
+                    messages=messages,
+                    max_tokens=self.args["max_tokens"],
+                    timeout=self.args["request_timeout"]
+                )
+                res_content = response.choices[0].message.content.strip()
+                total_tokens = response.usage.total_tokens
+                completion_tokens = response.usage.completion_tokens
+            else:
+                # 使用旧版本的 API 调用方式
+                response = openai.ChatCompletion.create(
+                    model=self.args["model"],
+                    messages=messages,
+                    max_tokens=self.args["max_tokens"],
+                    timeout=self.args["request_timeout"]
+                )
+                res_content = response.choices[0]["message"]["content"].strip()
+                total_tokens = response["usage"]["total_tokens"]
+                completion_tokens = response["usage"]["completion_tokens"]
+            
             logger.info("[OPEN_AI] reply={}".format(res_content))
             return {
                 "total_tokens": total_tokens,
@@ -95,7 +143,11 @@ class OpenAIBot(Bot, OpenAIImage):
             }
         except Exception as e:
             need_retry = retry_count < 2
-            result = {"completion_tokens": 0, "content": "我现在有点累了，等会再来吧"}
+            result = {
+                "total_tokens": 0,
+                "completion_tokens": 0,
+                "content": "我现在有点累了，等会再来吧"
+            }
             if isinstance(e, openai.error.RateLimitError):
                 logger.warn("[OPEN_AI] RateLimitError: {}".format(e))
                 result["content"] = "提问太快啦，请休息一下再问我吧"

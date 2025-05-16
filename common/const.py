@@ -20,26 +20,12 @@ DEEPSEEK = "deepseek"  # 添加DeepSeek类型
 MODELSCOPE = "modelscope"  # 添加ModelScope类型
 
 # openAI models
-CLAUDE3 = "claude-3-opus-20240229"
-GPT35 = "gpt-3.5-turbo"
-GPT35_0125 = "gpt-3.5-turbo-0125"
-GPT35_1106 = "gpt-3.5-turbo-1106"
-GPT_4O_0806 = "gpt-4o-2024-08-06"
-GPT4_TURBO = "gpt-4-turbo"
-GPT4_TURBO_PREVIEW = "gpt-4-turbo-preview"
-GPT4_TURBO_04_09 = "gpt-4-turbo-2024-04-09"
-GPT4_TURBO_01_25 = "gpt-4-0125-preview"
-GPT4_TURBO_11_06 = "gpt-4-1106-preview"
-GPT4_VISION_PREVIEW = "gpt-4-vision-preview"
-GPT_4O = "gpt-4o"
-GPT_4O_MINI = "gpt-4o-mini"
-GPT4 = "gpt-4"
-GPT_4o_MINI = "gpt-4o-mini"
-GPT4_32k = "gpt-4-32k"
-GPT4_06_13 = "gpt-4-0613"
-GPT4_32k_06_13 = "gpt-4-32k-0613"
-O1 = "o1-preview"
 O1_MINI = "o1-mini"
+GPT_41 = "gpt-4.1"
+GPT_41_MINI = "gpt-4.1-mini"
+GPT_41_NANO = "gpt-4.1-nano"
+GPT_4O_MINI = "gpt-4o-mini"
+GPT_4O_MINI_SEARCH = "gpt-4o-mini-search-preview"
 
 WHISPER_1 = "whisper-1"
 TTS_1 = "tts-1"
@@ -84,7 +70,7 @@ DIFY_CHATBOT = "chatbot"
 DIFY_AGENT = "agent"
 DIFY_WORKFLOW = "workflow"
 
-MODEL_LIST = [OPEN_AI, CLAUDE3, GPT35, GPT_4O_MINI, O1_MINI,
+MODEL_LIST = [OPEN_AI, O1_MINI, GPT_41, GPT_41_MINI, GPT_41_NANO, GPT_4O_MINI, GPT_4O_MINI_SEARCH,
               QWEN_DASHSCOPE, QWEN_PLUS, QWEN_MAX, QWEN_TURBO, QWEN3_235B, QWEN3_32B, QWEN3_14B, QWQ_PLUS, QWEN_CHAT, QWEN_R1,
               ZHIPU_AI, GLM_4_PLUS, GLM_4_FLASH, GLM_Z1_FLASH, 
               SILICONFLOW, DEEPSEEK_V3, DEEPSEEK_R1, QWEN_2_7B, GLM_4_9B, GLM_Z1_9B, GLM_Z1_R_32B,

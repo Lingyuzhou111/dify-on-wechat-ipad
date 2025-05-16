@@ -19,8 +19,8 @@ available_setting = {
     "error_reply": "我暂时遇到了一些问题，请您稍后重试~",
     # openai api配置
     "open_ai_api_key": "",  # openai api key
-    # openai apibase，当use_azure_chatgpt为true时，需要设置对应的api base
     "open_ai_api_base": "https://api.openai.com/v1",
+    "open_ai_model": "gpt-4o-mini",  # OpenAI 模型名称
     "proxy": "",  # openai使用的代理
     # chatgpt模型， 当use_azure_chatgpt为true时，其名称为Azure上model deployment名称
     "model": "对话模型 [openAI, chatGPT, wenxin, xunfei, zhipuai, claude, qwen, dashscope, gemini, moonshot, coze, dify, deepseek，siliconflow]",   # 可选择: gpt-4o, pt-4o-mini, gpt-4-turbo, claude-3-sonnet, wenxin, moonshot, qwen-turbo, xunfei, glm-4, minimax, gemini等模型，全部可选模型详见common/const.py文件

@@ -7,6 +7,7 @@
   "wx849_api_port": 9011,
   "wx849_protocol_version": "849",
   "log_level": "INFO",
+  "debug": false ,  
   "group_chat_prefix": ["xy","晓颜","@晓颜"],
   "group_name_white_list": [
         "测试群1",
@@ -29,6 +30,9 @@
   "group_speech_recognition": false,
   "model": "qwen-max",
   "no_need_at": true,
+  "open_ai_api_base": "https://vip.apiyi.com/v1",
+  "open_ai_api_key": "",
+  "open_ai_model": "gpt-4o-mini",
   "siliconflow_api_base": "https://api.siliconflow.cn/v1/chat/completions",
   "siliconflow_api_key": "",
   "siliconflow_model": "deepseek-ai/DeepSeek-V3",

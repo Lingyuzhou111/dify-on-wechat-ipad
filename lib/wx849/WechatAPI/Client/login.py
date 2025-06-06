@@ -303,6 +303,73 @@ class LoginMixin(WechatAPIClientBase):
             else:
                 return False
 
+    async def update_device_token(self, wxid: str = "", device_id: str = "") -> bool:
+        """刷新设备Token，延长session有效期。
+
+        Args:
+            wxid (str, optional): 要刷新的微信ID. Defaults to "".
+            device_id (str, optional): 设备ID. Defaults to "".
+
+        Returns:
+            bool: 成功返回True，否则返回False
+
+        Raises:
+            Exception: 如果未提供wxid且未登录
+            根据error_handler处理错误
+        """
+        if not wxid and not self.wxid:
+            raise Exception("Please login first")
+
+        if not wxid and self.wxid:
+            wxid = self.wxid
+
+        async with aiohttp.ClientSession() as session:
+            json_param = {"wxid": wxid}
+            if device_id:
+                json_param["deviceId"] = device_id
+            
+            response = await session.post(f'http://{self.ip}:{self.port}{self.api_path_prefix}/Login/UpdateDeviceToken', data=json_param)
+            json_resp = await response.json()
+
+            if json_resp.get("Success"):
+                return True
+            else:
+                # self.error_handler(json_resp)
+                return False
+
+    async def refresh_token(self, wxid: str = "", device_id: str = "") -> bool:
+        """刷新登录Token，延长session有效期。
+
+        Args:
+            wxid (str, optional): 要刷新的微信ID. Defaults to "".
+            device_id (str, optional): 设备ID. Defaults to "".
+
+        Returns:
+            bool: 成功返回True，否则返回False
+
+        Raises:
+            Exception: 如果未提供wxid且未登录
+            根据error_handler处理错误
+        """
+        if not wxid and not self.wxid:
+            raise Exception("Please login first")
+
+        if not wxid and self.wxid:
+            wxid = self.wxid
+
+        async with aiohttp.ClientSession() as session:
+            json_param = {"wxid": wxid}
+            if device_id:
+                json_param["deviceId"] = device_id
+            
+            response = await session.post(f'http://{self.ip}:{self.port}{self.api_path_prefix}/Login/RefreshToken', data=json_param)
+            json_resp = await response.json()
+
+            if json_resp.get("Success"):
+                return True
+            else:
+                # self.error_handler(json_resp)
+                return False
 
     @staticmethod
     def create_device_name() -> str:

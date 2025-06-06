@@ -919,6 +919,45 @@ class WX849Channel(ChatChannel):
         else:
             logger.error(f"[WX849] bot对象没有wxid属性，可能导致消息获取失败")
 
+        # 启动自动session刷新功能
+        try:
+            import sys
+            import os
+            # 添加项目根目录到path
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            if project_root not in sys.path:
+                sys.path.append(project_root)
+            
+            from auto_session_refresh import init_session_refresh, get_session_refresh_manager
+            
+            # 读取API配置
+            api_host = conf().get("wx849_api_host", "127.0.0.1")
+            api_port = conf().get("wx849_api_port", 9011)  # 从测试确认应该是9011端口
+            protocol_version = conf().get("wx849_protocol_version", "849")
+            api_path_prefix = "/VXAPI" if protocol_version == "849" else "/api"
+            
+            # 获取设备ID（如果有的话）
+            device_id = ""
+            device_info_path = os.path.join(get_appdata_dir(), "wx849_device_info.json")
+            if os.path.exists(device_info_path):
+                try:
+                    with open(device_info_path, "r", encoding="utf-8") as f:
+                        device_info = json.load(f)
+                        device_id = device_info.get("device_id", "")
+                except Exception as e:
+                    logger.warning(f"[WX849] 读取设备ID失败: {e}")
+            
+            # 初始化session刷新管理器
+            refresh_manager = init_session_refresh(api_host, api_port, api_path_prefix)
+            refresh_manager.set_login_info(wxid, device_id)
+            refresh_manager.start_auto_refresh()
+            
+            logger.info("[WX849] ✓ Session自动刷新功能已启动，将自动防止3天掉线问题")
+        except Exception as e:
+            logger.error(f"[WX849] 启动Session自动刷新功能失败: {e}")
+            import traceback
+            logger.error(f"[WX849] 详细错误: {traceback.format_exc()}")
+
         # 异步获取用户资料
         threading.Thread(target=lambda: asyncio.run(self._get_user_profile())).start()
 
@@ -957,7 +996,7 @@ class WX849Channel(ChatChannel):
                 # 获取新消息
                 try:
                     # 注释掉频繁打印的调试日志
-                    # logger.debug("[WX849] 正在获取新消息...")
+                    logger.debug("[WX849] 正在获取新消息...")
                     messages = await self.bot.get_new_message()
                     # 重置错误计数
                     error_count = 0

@@ -575,10 +575,14 @@ class WX849Channel(ChatChannel):
                         logger.error("[WX849] 无法从登录结果中获取微信ID")
                         return False, ""
                     
-                    # 保存登录和设备信息到本地文件
+                    # 保存登录和设备信息到本地文件，包含最新的登录时间戳
                     try:
+                        import time
+                        current_login_time = int(time.time())  # 记录当前登录时间戳
+                        
                         device_info = {
                             "wxid": new_wxid,
+                            "login_time": current_login_time,  # 动态更新登录时间
                             "device_id": device_id,
                             "device_name": device_name
                         }
@@ -586,7 +590,12 @@ class WX849Channel(ChatChannel):
                         os.makedirs(os.path.dirname(device_info_path), exist_ok=True)
                         with open(device_info_path, "w", encoding="utf-8") as f:
                             json.dump(device_info, f, indent=2)
+                        
+                        # 记录登录时间更新
+                        from datetime import datetime
+                        login_time_str = datetime.fromtimestamp(current_login_time).strftime("%Y-%m-%d %H:%M:%S")
                         logger.info(f"[WX849] 已保存登录信息到: {device_info_path}")
+                        logger.info(f"[WX849] 登录时间戳已更新: {current_login_time} ({login_time_str})")
                     except Exception as e:
                         logger.error(f"[WX849] 保存登录信息失败: {e}")
                     
@@ -711,11 +720,18 @@ class WX849Channel(ChatChannel):
             
             logger.debug(f"[WX849] 二次登录参数: {params}")
             
-            # 调用二次登录接口
-            response = await self._call_api("/Login/TwiceAutoAuth", params)
-            
-            # 打印响应内容以便调试
-            logger.debug(f"[WX849] 二次登录响应: {response}")
+            # 调用二次登录接口，增加详细的错误处理
+            try:
+                response = await self._call_api("/Login/TwiceAutoAuth", params)
+                logger.debug(f"[WX849] 二次登录原始响应: {response}")
+            except json.JSONDecodeError as json_err:
+                logger.error(f"[WX849] 二次登录响应JSON解析失败: {json_err}")
+                logger.error(f"[WX849] 这通常表示API服务器返回了非JSON格式的数据")
+                logger.error(f"[WX849] 建议检查API服务器状态或重启API服务")
+                return False
+            except Exception as api_err:
+                logger.error(f"[WX849] 二次登录API调用失败: {api_err}")
+                return False
             
             if response and isinstance(response, dict) and response.get("Success", False):
                 logger.info(f"[WX849] 二次登录成功: wxid={wxid}")
@@ -726,6 +742,15 @@ class WX849Channel(ChatChannel):
                 error_msg = response.get("Message", "未知错误")
                 error_code = response.get("Code", 0)
                 logger.warning(f"[WX849] 二次登录失败，错误码: {error_code}, 错误信息: {error_msg}")
+                
+                # 根据错误码提供更详细的诊断
+                if error_code == -8:
+                    logger.error(f"[WX849] 错误码-8通常表示JSON解析错误或API格式问题")
+                    logger.error(f"[WX849] 建议：1) 检查API服务器版本是否匹配 2) 重启API服务器 3) 检查网络连接")
+                elif error_code == -13:
+                    logger.error(f"[WX849] 错误码-13表示session已过期，需要重新登录")
+                elif error_code == -1:
+                    logger.error(f"[WX849] 错误码-1表示通用错误，检查API服务器状态")
             else:
                 logger.warning(f"[WX849] 二次登录失败，响应无效: {response}")
             
@@ -918,48 +943,55 @@ class WX849Channel(ChatChannel):
             logger.info(f"[WX849] 已同步设置bot.wxid = {wxid}")
         else:
             logger.error(f"[WX849] bot对象没有wxid属性，可能导致消息获取失败")
+            
+        # 更新登录时间戳到设备信息文件
+        self._update_login_timestamp(wxid)
 
-        # 启动自动session刷新功能
+        # 异步获取用户资料
+        threading.Thread(target=lambda: asyncio.run(self._get_user_profile())).start()
+
+    def _update_login_timestamp(self, wxid):
+        """更新登录时间戳到设备信息文件"""
         try:
-            import sys
-            import os
-            # 添加项目根目录到path
-            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            if project_root not in sys.path:
-                sys.path.append(project_root)
+            import time
+            from datetime import datetime
             
-            from auto_session_refresh import init_session_refresh, get_session_refresh_manager
-            
-            # 读取API配置
-            api_host = conf().get("wx849_api_host", "127.0.0.1")
-            api_port = conf().get("wx849_api_port", 9011)  # 从测试确认应该是9011端口
-            protocol_version = conf().get("wx849_protocol_version", "849")
-            api_path_prefix = "/VXAPI" if protocol_version == "849" else "/api"
-            
-            # 获取设备ID（如果有的话）
-            device_id = ""
             device_info_path = os.path.join(get_appdata_dir(), "wx849_device_info.json")
+            current_login_time = int(time.time())  # 记录当前登录时间戳
+            
+            # 读取现有的设备信息
+            device_info = {}
             if os.path.exists(device_info_path):
                 try:
                     with open(device_info_path, "r", encoding="utf-8") as f:
                         device_info = json.load(f)
-                        device_id = device_info.get("device_id", "")
                 except Exception as e:
-                    logger.warning(f"[WX849] 读取设备ID失败: {e}")
+                    logger.warning(f"[WX849] 读取现有设备信息失败: {e}")
             
-            # 初始化session刷新管理器
-            refresh_manager = init_session_refresh(api_host, api_port, api_path_prefix)
-            refresh_manager.set_login_info(wxid, device_id)
-            refresh_manager.start_auto_refresh()
+            # 更新登录时间戳，保留其他信息
+            device_info["wxid"] = wxid
+            device_info["login_time"] = current_login_time
             
-            logger.info("[WX849] ✓ Session自动刷新功能已启动，将自动防止3天掉线问题")
+            # 如果没有设备信息，使用默认值
+            if "device_id" not in device_info:
+                device_info["device_id"] = ""
+            if "device_name" not in device_info:
+                device_info["device_name"] = "DoW微信机器人"
+            
+            # 保存更新后的设备信息
+            os.makedirs(os.path.dirname(device_info_path), exist_ok=True)
+            with open(device_info_path, "w", encoding="utf-8") as f:
+                json.dump(device_info, f, indent=2, ensure_ascii=False)
+            
+            # 记录登录时间更新
+            login_time_str = datetime.fromtimestamp(current_login_time).strftime("%Y-%m-%d %H:%M:%S")
+            logger.info(f"[WX849] 登录时间戳已动态更新: {current_login_time} ({login_time_str})")
+            logger.info(f"[WX849] 设备信息文件路径: {device_info_path}")
+            
         except Exception as e:
-            logger.error(f"[WX849] 启动Session自动刷新功能失败: {e}")
+            logger.error(f"[WX849] 更新登录时间戳失败: {e}")
             import traceback
             logger.error(f"[WX849] 详细错误: {traceback.format_exc()}")
-
-        # 异步获取用户资料
-        threading.Thread(target=lambda: asyncio.run(self._get_user_profile())).start()
 
     async def _get_user_profile(self):
         """获取用户资料"""
@@ -3635,8 +3667,6 @@ class WX849Channel(ChatChannel):
             if not to_user_id:
                 logger.error("[WX849] 发送图片失败: 接收者ID为空")
                 return None
-
-            # ... (省略后续未修改的代码) ...
 
             # 构建API参数 - 使用正确的参数格式
             params = {

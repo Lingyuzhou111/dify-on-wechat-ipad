@@ -599,11 +599,8 @@ class WX849Channel(ChatChannel):
                     except Exception as e:
                         logger.error(f"[WX849] 保存登录信息失败: {e}")
                     
-                    # 设置登录状态
-                    self.wxid = new_wxid
-                    self.user_id = new_wxid
+                    # 设置登录状态 - 扫码登录需要更新时间戳
                     self.name = new_name or new_wxid
-                    self.is_logged_in = True
                     
                     # 同步设置bot的wxid属性，确保消息获取不会失败
                     if hasattr(self.bot, 'wxid'):
@@ -611,6 +608,9 @@ class WX849Channel(ChatChannel):
                         logger.info(f"[WX849] 已同步设置bot.wxid = {new_wxid}")
                     else:
                         logger.error(f"[WX849] bot对象没有wxid属性，可能导致消息获取失败")
+                    
+                    # 扫码登录成功，需要更新时间戳
+                    self._set_logged_in_state(new_wxid, update_timestamp=True)
                     
                     logger.info(f"[WX849] 登录信息: user_id={self.user_id}, nickname={self.name}")
                     
@@ -834,7 +834,8 @@ class WX849Channel(ChatChannel):
             else:
                 logger.error(f"[WX849] bot对象没有wxid属性，可能导致消息获取失败")
                 
-            self._set_logged_in_state(saved_wxid)
+            # 心跳检测成功是自动登录，不更新时间戳
+            self._set_logged_in_state(saved_wxid, update_timestamp=False)
             return True
         
         logger.info(f"[WX849] 心跳检测失败，继续尝试其他自动登录方式")
@@ -861,7 +862,8 @@ class WX849Channel(ChatChannel):
             else:
                 logger.error(f"[WX849] bot对象没有wxid属性，可能导致消息获取失败")
                 
-            self._set_logged_in_state(saved_wxid)
+            # 二次登录成功是自动登录，不更新时间戳
+            self._set_logged_in_state(saved_wxid, update_timestamp=False)
             return True
         
         logger.info(f"[WX849] 二次登录失败，尝试唤醒登录")
@@ -888,7 +890,8 @@ class WX849Channel(ChatChannel):
             else:
                 logger.error(f"[WX849] bot对象没有wxid属性，可能导致消息获取失败")
                 
-            self._set_logged_in_state(saved_wxid)
+            # 唤醒登录确认成功是自动登录，不更新时间戳
+            self._set_logged_in_state(saved_wxid, update_timestamp=False)
             return True
         
         logger.warning(f"[WX849] 唤醒登录确认失败，自动登录流程失败")
@@ -931,8 +934,13 @@ class WX849Channel(ChatChannel):
         logger.error("[WX849] 等待登录确认超时")
         return False
 
-    def _set_logged_in_state(self, wxid):
-        """设置登录成功状态"""
+    def _set_logged_in_state(self, wxid, update_timestamp=False):
+        """设置登录成功状态
+        
+        Args:
+            wxid: 微信ID
+            update_timestamp: 是否更新登录时间戳，只有真正的扫码登录才应该为True
+        """
         self.wxid = wxid
         self.user_id = wxid
         self.is_logged_in = True
@@ -944,8 +952,12 @@ class WX849Channel(ChatChannel):
         else:
             logger.error(f"[WX849] bot对象没有wxid属性，可能导致消息获取失败")
             
-        # 更新登录时间戳到设备信息文件
-        self._update_login_timestamp(wxid)
+        # 只有在真正的扫码登录时才更新登录时间戳
+        if update_timestamp:
+            self._update_login_timestamp(wxid)
+            logger.info(f"[WX849] 扫码登录完成，已更新登录时间戳")
+        else:
+            logger.info(f"[WX849] 自动登录成功，保持原有登录时间戳不变")
 
         # 异步获取用户资料
         threading.Thread(target=lambda: asyncio.run(self._get_user_profile())).start()
